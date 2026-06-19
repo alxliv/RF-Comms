@@ -31,6 +31,8 @@ enum {
     COMMAND_TIMEOUT_MS = 150,
     AUTO_ACK_GUARD_US = 500,
     GETSTAT_DATA_SIZE = 11,
+    RF_CHANNEL_COUNT = 126,
+    RF_SCAN_SAMPLES = 16,
 };
 
 typedef enum {
@@ -134,6 +136,7 @@ static void make_address(uint8_t id,
 static void start_station_receiver(void) {
     uint8_t address[NRF24_ADDRESS_SIZE];
     make_address(station_id, address);
+    nrf24_set_channel(&radio, RF_CHANNEL);
     nrf24_start_listening(&radio, address);
 }
 
@@ -433,6 +436,7 @@ static void print_help(void) {
     printf("  status       Show selected remote and radio status\r\n");
     printf("  status all   Show all used remote contexts\r\n");
     printf("  stats reset  Clear communication statistics\r\n");
+    printf("  scan         Measure local RF energy on channels 0..125\r\n");
     if (role == ROLE_BASE) {
         printf("  select N     Select remote ID 1..16\r\n");
         printf("  getstat      Request selected remote status\r\n");
@@ -495,6 +499,70 @@ static void reset_statistics(void) {
     }
 }
 
+static bool any_command_pending(void) {
+    for (uint8_t index = 0; index < REMOTE_CONTEXT_COUNT; ++index) {
+        if (remote_contexts[index].pending.waiting) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void scan_rf_channels(void) {
+    uint8_t detected[RF_CHANNEL_COUNT];
+    uint8_t occupied_channels = 0;
+    uint8_t peak_channel = 0;
+    uint8_t peak_hits = 0;
+
+    if (role == ROLE_BASE && any_command_pending()) {
+        printf("Cannot scan while commands are pending\r\n");
+        return;
+    }
+
+    printf("RF scan start: %u samples/channel, 10 ms/sample, "
+           "RPD threshold approximately -64 dBm\r\n",
+           RF_SCAN_SAMPLES);
+
+    for (uint8_t channel = 0; channel < RF_CHANNEL_COUNT; ++channel) {
+        detected[channel] = nrf24_measure_channel_noise(
+            &radio, channel, RF_SCAN_SAMPLES);
+        if (detected[channel] != 0) {
+            ++occupied_channels;
+        }
+        if (detected[channel] > peak_hits) {
+            peak_hits = detected[channel];
+            peak_channel = channel;
+        }
+    }
+
+    start_station_receiver();
+
+    for (uint8_t channel = 0; channel < RF_CHANNEL_COUNT; ++channel) {
+        const uint32_t noise_percent =
+            ((uint32_t)detected[channel] * 100u +
+             RF_SCAN_SAMPLES / 2u) /
+            RF_SCAN_SAMPLES;
+        printf("channel=%3u frequency=%4uMHz noise=%3lu%% "
+               "hits=%u/%u\r\n",
+               channel, 2400u + channel,
+               (unsigned long)noise_percent, detected[channel],
+               RF_SCAN_SAMPLES);
+    }
+    if (occupied_channels == 0) {
+        printf("RF scan summary: no energy above the RPD threshold "
+               "was detected\r\n");
+    } else {
+        const uint32_t peak_percent =
+            ((uint32_t)peak_hits * 100u + RF_SCAN_SAMPLES / 2u) /
+            RF_SCAN_SAMPLES;
+        printf("RF scan summary: occupied_channels=%u "
+               "peak_channel=%u peak_noise=%lu%%\r\n",
+               occupied_channels, peak_channel,
+               (unsigned long)peak_percent);
+    }
+    printf("RF scan complete; restored channel %u\r\n", RF_CHANNEL);
+}
+
 static void process_command_line(char *line) {
     if (strcmp(line, "help") == 0) {
         print_help();
@@ -505,6 +573,8 @@ static void process_command_line(char *line) {
     } else if (strcmp(line, "stats reset") == 0) {
         reset_statistics();
         printf("Statistics reset\r\n");
+    } else if (strcmp(line, "scan") == 0) {
+        scan_rf_channels();
     } else if (role == ROLE_BASE && strcmp(line, "getstat") == 0) {
         send_command(selected_remote_id, RF_COMMAND_GETSTAT, 0);
     } else if (role == ROLE_BASE && strcmp(line, "stop") == 0) {

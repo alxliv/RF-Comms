@@ -36,6 +36,7 @@ void nrf24_init_pins(nrf24_t *radio, spi_inst_t *spi, uint8_t pin_csn,
                      uint8_t pin_miso);
 bool nrf24_init(nrf24_t *radio, uint8_t channel);
 bool nrf24_check_config(nrf24_t *radio, uint8_t channel);
+void nrf24_set_channel(nrf24_t *radio, uint8_t channel);
 void nrf24_start_listening(nrf24_t *radio,
                            const uint8_t address[NRF24_ADDRESS_SIZE]);
 nrf24_tx_report_t nrf24_send(
@@ -46,5 +47,7 @@ bool nrf24_receive(nrf24_t *radio,
 uint8_t nrf24_read_status(nrf24_t *radio);
 uint8_t nrf24_read_channel(nrf24_t *radio);
 uint8_t nrf24_read_rf_setup(nrf24_t *radio);
+uint8_t nrf24_measure_channel_noise(nrf24_t *radio, uint8_t channel,
+                                    uint8_t samples);
 
 #endif

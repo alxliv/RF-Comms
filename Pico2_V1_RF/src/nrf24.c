@@ -21,6 +21,7 @@ enum {
     NRF24_REG_RF_SETUP = 0x06,
     NRF24_REG_STATUS = 0x07,
     NRF24_REG_OBSERVE_TX = 0x08,
+    NRF24_REG_RPD = 0x09,
     NRF24_REG_RX_ADDR_P0 = 0x0A,
     NRF24_REG_TX_ADDR = 0x10,
     NRF24_REG_RX_PW_P0 = 0x11,
@@ -47,6 +48,7 @@ enum {
     NRF24_RF_SETUP_VALUE = 0x00,
     NRF24_TX_TIMEOUT_MS = 30,
     NRF24_MODE_SETTLE_US = 150,
+    NRF24_RPD_SAMPLE_US = 10000,
 };
 
 static void csn_low(const nrf24_t *radio) {
@@ -184,6 +186,12 @@ bool nrf24_check_config(nrf24_t *radio, uint8_t channel) {
                NRF24_PAYLOAD_SIZE;
 }
 
+void nrf24_set_channel(nrf24_t *radio, uint8_t channel) {
+    gpio_put(radio->pin_ce, false);
+    write_register(radio, NRF24_REG_RF_CH,
+                   (uint8_t)(channel & 0x7Fu));
+}
+
 void nrf24_start_listening(nrf24_t *radio,
                            const uint8_t address[NRF24_ADDRESS_SIZE]) {
     gpio_put(radio->pin_ce, false);
@@ -273,4 +281,39 @@ uint8_t nrf24_read_channel(nrf24_t *radio) {
 
 uint8_t nrf24_read_rf_setup(nrf24_t *radio) {
     return read_register(radio, NRF24_REG_RF_SETUP);
+}
+
+uint8_t nrf24_measure_channel_noise(nrf24_t *radio, uint8_t channel,
+                                    uint8_t samples) {
+    uint8_t detected_samples = 0;
+
+    gpio_put(radio->pin_ce, false);
+    write_register(radio, NRF24_REG_RF_CH,
+                   (uint8_t)(channel & 0x7Fu));
+    write_register(radio, NRF24_REG_CONFIG,
+                   NRF24_CONFIG_CRC2_POWERED_UP |
+                       NRF24_CONFIG_PRIM_RX);
+
+    for (uint8_t sample = 0; sample < samples; ++sample) {
+        gpio_put(radio->pin_ce, true);
+        /*
+         * RPD is valid after about 130 us, but a longer receive window is
+         * needed to detect bursty Wi-Fi and other intermittent traffic.
+         */
+        sleep_us(NRF24_RPD_SAMPLE_US);
+        /*
+         * Ending the receive period latches whether energy was detected
+         * during that period. Read RPD only after CE goes low; reading it
+         * while CE is high is merely an instantaneous snapshot.
+         */
+        gpio_put(radio->pin_ce, false);
+        if ((read_register(radio, NRF24_REG_RPD) & 0x01u) != 0) {
+            ++detected_samples;
+        }
+        sleep_us(10);
+    }
+
+    command(radio, NRF24_CMD_FLUSH_RX);
+    write_register(radio, NRF24_REG_STATUS, NRF24_STATUS_RX_DR);
+    return detected_samples;
 }

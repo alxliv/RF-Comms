@@ -301,6 +301,7 @@ getstat
 move 1
 move -20
 stop
+scan
 ```
 
 The remote prints every accepted command and whether its response was
@@ -313,3 +314,29 @@ base prints `CONNECTION LOST`.
 remote context that has been used. Statistics include hardware retransmissions,
 invalid packets, sent and acknowledged commands, command timeouts, response
 transmission failures, and average/maximum response time.
+
+### RF channel scan
+
+The `scan` command measures local RF activity on nRF24 channels 0 through 125
+(2400 through 2525 MHz). It takes 16 ten-millisecond RPD samples per channel
+and prints:
+
+```text
+channel= 76 frequency=2476MHz noise= 25% hits=8/32
+```
+
+The nRF24 RPD detector is binary. A hit means received energy exceeded
+approximately -64 dBm during that sample. Therefore `noise` is the percentage
+of samples with detected RF energy; it is not a calibrated signal-strength or
+dBm measurement. Firmware ends each receive window by lowering CE before
+reading RPD, because the nRF24 latches detection for the completed receive
+period at that transition.
+
+Scanning temporarily stops normal communication on that station for roughly
+20 seconds. The base refuses to start a scan while any remote command is
+pending. After scanning, firmware restores the configured channel, station
+receive address, and receive mode.
+
+An all-zero result means no signal crossed the approximately -64 dBm threshold
+during the observation windows. It does not prove that the band is free of
+weaker or very infrequent interference.
