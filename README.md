@@ -107,3 +107,73 @@ The generated UF2 is:
 ```text
 Pico2_BasicRF/build-release/pico2_basic_rf.uf2
 ```
+
+## Basic RF ping/reply test
+
+Flash the same UF2 onto both Pico 2 boards. Set the hardware straps before
+powering or resetting each board:
+
+- Base: GP20 high. Its station ID is always 0.
+- Remote 1: GP20 low and GP10..GP13 low.
+- Other remotes: GP20 low; GP10..GP13 contain the binary value `ID - 1`.
+
+The Pico and the E01 external power supply must share a common ground. Attach
+the antenna before transmitting.
+
+Current radio settings:
+
+- Channel 76
+- 1 Mbps
+- Two-byte CRC
+- Hardware auto-acknowledgement and retransmission
+- Lowest nRF24 transmit-power setting
+- Fixed eight-byte packets
+- GP15 IRQ reserved but not used; firmware polls the radio
+
+After startup, the remote listens on its station address. The base selects
+remote 1 by default and sends a ping every second. Expected base USB CDC output:
+
+```text
+Pico2 Basic RF
+Role: base
+Station ID: 0
+Radio: detected
+PING remote=1 sequence=1
+REPLY remote=1 sequence=1
+```
+
+If the remote does not acknowledge the packet, the base reports:
+
+```text
+RF transmit failed: no acknowledgement
+```
+
+Base USB commands:
+
+```text
+help
+status
+select 1
+ping
+```
+
+`select N` accepts remote IDs from 1 through 16. `ping` immediately pings the
+selected remote; automatic pings continue once per second.
+
+### Important nRF24 reply timing
+
+After receiving a packet with hardware auto-acknowledgement enabled, do not
+immediately lower CE and switch the radio from PRX to PTX for an
+application-level reply. The nRF24 still needs time to transmit its automatic
+ACK.
+
+This firmware waits 500 microseconds after reading a valid ping before starting
+the remote's explicit reply transmission. Without this guard interval, the
+remote can interrupt its automatic ACK. The observed failure is:
+
+- The remote receives every ping.
+- The base reports `RF transmit failed: no acknowledgement`.
+- The remote reports `reply=timeout`.
+
+Also allow at least 150 microseconds after changing the radio from PRX to PTX
+before pulsing CE to start transmission.

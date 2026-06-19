@@ -382,6 +382,23 @@ response paths. Capture state first and print later.
 - Use structured SDK APIs rather than direct register access unless direct
   access is required and documented.
 
+### nRF24 auto-ACK and reply timing
+
+When using nRF24 hardware auto-acknowledgement, do not immediately lower CE and
+switch from PRX to PTX after reading a received packet. Allow the radio to
+finish transmitting its automatic ACK before starting an application-level
+reply. Use a guard interval of at least 500 microseconds unless the specific
+radio datasheet and measured timing justify another value.
+
+After changing from PRX to PTX, wait at least 150 microseconds before pulsing CE
+to start transmission.
+
+Interrupting the automatic ACK can produce this misleading pattern:
+
+- The receiver successfully reads every packet.
+- The original transmitter reports no acknowledgement.
+- The receiver's explicit reply transmission times out.
+
 ## Flashing
 
 For BOOTSEL flashing:

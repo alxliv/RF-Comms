@@ -15,11 +15,17 @@ pico_sdk_init()
 
 add_executable(pico2_basic_rf
     src/main.c
+    src/nrf24.c
+)
+
+target_include_directories(pico2_basic_rf PRIVATE
+    ${CMAKE_CURRENT_LIST_DIR}/src
 )
 
 target_link_libraries(pico2_basic_rf
     pico_stdlib
     hardware_gpio
+    hardware_spi
 )
 
 pico_enable_stdio_usb(pico2_basic_rf 1)
