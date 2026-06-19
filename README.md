@@ -177,3 +177,139 @@ remote can interrupt its automatic ACK. The observed failure is:
 
 Also allow at least 150 microseconds after changing the radio from PRX to PTX
 before pulsing CE to start transmission.
+
+## Pico2 V1 RF
+
+`Pico2_V1_RF` is the reliability-focused version. `Pico2_BasicRF` remains
+unchanged as the known-good hardware and wiring test.
+
+V1 retains the proven hardware configuration and nRF24 timing rules, and adds:
+
+- A separate RF address prefix, preventing accidental BasicRF/V1 interaction.
+- Fixed 32-byte command and response packets.
+- An application-level CRC16 in addition to the nRF24 hardware CRC.
+- Separate command and link context for each of 16 remote IDs.
+- Up to one outstanding command per remote.
+- An explicit response containing the received command ID.
+- The source remote ID encoded in the low four bits of every ACK byte, so the
+  base routes it to the correct context.
+- A 150-millisecond command-response timeout.
+- No application-level command retransmission. A response timeout is reported
+  as a lost connection to the selected remote.
+- Hardware retransmission counts from the nRF24 `OBSERVE_TX` register.
+- Link statistics and command response-time measurements.
+
+The nRF24 remains configured for channel 76, 1 Mbps, two-byte hardware CRC,
+hardware auto-acknowledgement, 15 hardware retransmissions, and the lowest
+transmit-power setting. These radio-level retransmissions are retained to
+improve delivery reliability; V1 does not resend a command at the application
+level. The remote still waits 500 microseconds before changing from receive
+mode to transmit mode for its explicit response.
+
+### V1 packet format
+
+The nRF24 maximum payload size is 32 bytes, so V1 uses constant 32-byte
+packets.
+
+Command packet:
+
+```text
+Byte 0      Command ID
+Byte 1      Signed command argument
+Bytes 2-29 Reserved, currently zero
+Bytes 30-31 CRC16-CCITT, little-endian
+```
+
+Normal ACK response for `move` and `stop`:
+
+```text
+Byte 0      0xF0 | (remote ID - 1)
+Byte 1      Received command ID
+Byte 2      Received command argument
+Bytes 3-29 Reserved, currently zero
+Bytes 30-31 CRC16-CCITT, little-endian
+```
+
+For example, `move 1` sends command bytes `0x0A 0x01`. The remote response
+from remote ID 3 starts with `0xF2 0x0A 0x01`.
+
+Data response for `getstat`:
+
+```text
+Byte 0      0xF0 | (remote ID - 1)
+Byte 1      0x01 (GETSTAT)
+Byte 2      Response data length
+Bytes 3-29 Response data, maximum 27 bytes
+Bytes 30-31 CRC16-CCITT, little-endian
+```
+
+The current `getstat` data is 11 bytes: signed movement value, 32-bit uptime in
+seconds, 32-bit received-command count, last command ID, and radio
+configuration status. The source remote ID is decoded from byte 0.
+
+The base allocates 16 independent remote contexts. Each context stores its
+pending command, timeout, connected state, movement/status data, hardware retry
+counters, command counters, and response timing. `select N` only changes which
+context subsequent CLI commands target; it does not replace or clear other
+remote contexts.
+
+The hardware ID strap uses GP10..GP13, so remote IDs are 1 through 16. The ACK
+byte values therefore range from `0xF0` for remote 1 through `0xFF` for remote
+16.
+
+Command IDs:
+
+```text
+0x01  GETSTAT
+0x0A  MOVE
+0x0B  STOP
+0xF0..0xFF  ACK marker and encoded source remote ID
+```
+
+### Building V1
+
+Run from the repository root in PowerShell:
+
+```powershell
+cmake -S Pico2_V1_RF `
+      -B Pico2_V1_RF/build-release `
+      -G Ninja `
+      -DPICO_BOARD=pico2 `
+      -DCMAKE_BUILD_TYPE=Release `
+      "-Dpicotool_DIR=$HOME\.pico-sdk\picotool\2.1.1\picotool"
+
+cmake --build Pico2_V1_RF/build-release --target pico2_v1_rf -j
+```
+
+The generated firmware is:
+
+```text
+Pico2_V1_RF/build-release/pico2_v1_rf.uf2
+```
+
+Flash the V1 UF2 onto both boards. The role and remote ID straps are unchanged.
+
+Base USB commands:
+
+```text
+help
+status
+status all
+stats reset
+select 1
+getstat
+move 1
+move -20
+stop
+```
+
+The remote prints every accepted command and whether its response was
+transmitted. The base accepts an ACK only when its command ID and argument
+match the outstanding command. `getstat` instead returns the data block
+described above. If no matching response arrives within 150 milliseconds, the
+base prints `CONNECTION LOST`.
+
+`status` reports the selected remote context. `status all` reports every
+remote context that has been used. Statistics include hardware retransmissions,
+invalid packets, sent and acknowledged commands, command timeouts, response
+transmission failures, and average/maximum response time.
