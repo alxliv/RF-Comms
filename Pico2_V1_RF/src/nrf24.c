@@ -45,7 +45,8 @@ enum {
     NRF24_CONFIG_CRC2_POWERED_UP =
         NRF24_CONFIG_EN_CRC | NRF24_CONFIG_CRCO | NRF24_CONFIG_PWR_UP,
     NRF24_SETUP_RETR_VALUE = 0x2F,
-    NRF24_RF_SETUP_VALUE = 0x00,
+    NRF24_RF_SETUP_BASE = 0x00,
+    NRF24_RF_SETUP_POWER_MASK = 0x06,
     NRF24_TX_TIMEOUT_MS = 30,
     NRF24_MODE_SETTLE_US = 150,
     NRF24_RPD_SAMPLE_US = 10000,
@@ -157,7 +158,7 @@ bool nrf24_init(nrf24_t *radio, uint8_t channel) {
     write_register(radio, NRF24_REG_SETUP_RETR,
                    NRF24_SETUP_RETR_VALUE);
     write_register(radio, NRF24_REG_RF_CH, (uint8_t)(channel & 0x7Fu));
-    write_register(radio, NRF24_REG_RF_SETUP, NRF24_RF_SETUP_VALUE);
+    write_register(radio, NRF24_REG_RF_SETUP, NRF24_RF_SETUP_BASE);
     write_register(radio, NRF24_REG_RX_PW_P0, NRF24_PAYLOAD_SIZE);
     write_register(radio, NRF24_REG_DYNPD, 0x00);
     write_register(radio, NRF24_REG_FEATURE, 0x00);
@@ -180,8 +181,9 @@ bool nrf24_check_config(nrf24_t *radio, uint8_t channel) {
                NRF24_SETUP_RETR_VALUE &&
            read_register(radio, NRF24_REG_RF_CH) ==
                (uint8_t)(channel & 0x7Fu) &&
-           read_register(radio, NRF24_REG_RF_SETUP) ==
-               NRF24_RF_SETUP_VALUE &&
+           (read_register(radio, NRF24_REG_RF_SETUP) &
+            (uint8_t)~NRF24_RF_SETUP_POWER_MASK) ==
+               NRF24_RF_SETUP_BASE &&
            read_register(radio, NRF24_REG_RX_PW_P0) ==
                NRF24_PAYLOAD_SIZE;
 }
@@ -190,6 +192,28 @@ void nrf24_set_channel(nrf24_t *radio, uint8_t channel) {
     gpio_put(radio->pin_ce, false);
     write_register(radio, NRF24_REG_RF_CH,
                    (uint8_t)(channel & 0x7Fu));
+}
+
+void nrf24_set_tx_power(nrf24_t *radio, uint8_t level) {
+    const bool was_listening = gpio_get(radio->pin_ce);
+    gpio_put(radio->pin_ce, false);
+
+    uint8_t rf_setup = read_register(radio, NRF24_REG_RF_SETUP);
+    rf_setup &= (uint8_t)~NRF24_RF_SETUP_POWER_MASK;
+    rf_setup |= (uint8_t)((level & 0x03u) << 1);
+    write_register(radio, NRF24_REG_RF_SETUP, rf_setup);
+
+    if (was_listening) {
+        gpio_put(radio->pin_ce, true);
+        sleep_us(NRF24_MODE_SETTLE_US);
+    }
+}
+
+uint8_t nrf24_get_tx_power(nrf24_t *radio) {
+    return (uint8_t)(
+        (read_register(radio, NRF24_REG_RF_SETUP) &
+         NRF24_RF_SETUP_POWER_MASK) >>
+        1);
 }
 
 void nrf24_start_listening(nrf24_t *radio,

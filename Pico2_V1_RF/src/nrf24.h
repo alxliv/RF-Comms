@@ -37,6 +37,8 @@ void nrf24_init_pins(nrf24_t *radio, spi_inst_t *spi, uint8_t pin_csn,
 bool nrf24_init(nrf24_t *radio, uint8_t channel);
 bool nrf24_check_config(nrf24_t *radio, uint8_t channel);
 void nrf24_set_channel(nrf24_t *radio, uint8_t channel);
+void nrf24_set_tx_power(nrf24_t *radio, uint8_t level);
+uint8_t nrf24_get_tx_power(nrf24_t *radio);
 void nrf24_start_listening(nrf24_t *radio,
                            const uint8_t address[NRF24_ADDRESS_SIZE]);
 nrf24_tx_report_t nrf24_send(

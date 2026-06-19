@@ -31,6 +31,9 @@ enum {
     COMMAND_TIMEOUT_MS = 150,
     AUTO_ACK_GUARD_US = 500,
     GETSTAT_DATA_SIZE = 11,
+    DEFAULT_POLL_PERIOD_MS = 500,
+    MIN_POLL_PERIOD_MS = 100,
+    MAX_POLL_PERIOD_MS = 60000,
     RF_CHANNEL_COUNT = 126,
     RF_SCAN_SAMPLES = 16,
 };
@@ -84,6 +87,9 @@ static remote_context_t remote_contexts[REMOTE_CONTEXT_COUNT];
 static station_role_t role;
 static uint8_t station_id;
 static uint8_t selected_remote_id = DEFAULT_REMOTE_ID;
+static bool periodic_poll_enabled;
+static uint32_t periodic_poll_ms = DEFAULT_POLL_PERIOD_MS;
+static absolute_time_t next_periodic_ping;
 
 static remote_context_t *remote_context(uint8_t remote_id) {
     if (remote_id < MIN_REMOTE_ID || remote_id > MAX_REMOTE_ID) {
@@ -168,9 +174,11 @@ static const char *send_result_text(nrf24_send_result_t result) {
             return "timeout";
     }
 }
-
 static bool send_command(uint8_t remote_id, uint8_t command,
                          int8_t argument) {
+
+    static int send_cmd_nums;
+
     remote_context_t *context = remote_context(remote_id);
     if (context == NULL) {
         return false;
@@ -179,16 +187,13 @@ static bool send_command(uint8_t remote_id, uint8_t command,
         printf("Remote %u already has a pending command\r\n", remote_id);
         return false;
     }
+    send_cmd_nums++;
 
     context->pending.command.command = command;
     context->pending.command.argument = argument;
 
     uint8_t packet[RF_PACKET_SIZE];
     protocol_encode_command(&context->pending.command, packet);
-    const nrf24_tx_report_t report =
-        transmit(remote_id, context, packet);
-    start_station_receiver();
-
     ++context->commands_sent;
     context->seen = true;
     context->pending.waiting = true;
@@ -196,7 +201,11 @@ static bool send_command(uint8_t remote_id, uint8_t command,
     context->pending.deadline =
         make_timeout_time_ms(COMMAND_TIMEOUT_MS);
 
-    printf("COMMAND remote=%u id=0x%02X arg=%d radio=%s hw_retry=%u\r\n",
+    const nrf24_tx_report_t report =
+        transmit(remote_id, context, packet);
+    start_station_receiver();
+
+    printf("[%d] COMMAND remote=%u id=0x%02X arg=%d radio=%s hw_retry=%u\r\n", send_cmd_nums,
            remote_id, command, argument,
            send_result_text(report.result), report.retransmit_count);
     return true;
@@ -288,10 +297,16 @@ static void process_base_responses(void) {
             } else if (response.command == RF_COMMAND_STOP) {
                 context->move_value = 0;
             }
-            printf("ACK remote=%u command=0x%02X arg=%d "
-                   "response_us=%lu\r\n",
-                   response.source_id, response.command,
-                   response.argument, (unsigned long)response_us);
+            if (response.command == RF_COMMAND_PING) {
+                printf("PING remote=%u latency_us=%lu\r\n",
+                       response.source_id,
+                       (unsigned long)response_us);
+            } else {
+                printf("ACK remote=%u command=0x%02X arg=%d "
+                       "response_us=%lu\r\n",
+                       response.source_id, response.command,
+                       response.argument, (unsigned long)response_us);
+            }
         }
     }
 }
@@ -326,11 +341,14 @@ static void build_getstat_data(const remote_context_t *context,
     data[10] = nrf24_check_config(&radio, RF_CHANNEL) ? 1 : 0;
 }
 
+static int recv_cmd_nums = 0;
+
 static void process_remote_commands(void) {
     remote_context_t *context = remote_context(station_id);
     uint8_t packet[RF_PACKET_SIZE];
 
     while (nrf24_receive(&radio, packet)) {
+        recv_cmd_nums++;
         rf_command_t command;
         if (!protocol_decode_command(packet, &command)) {
             ++station_stats.rx_invalid;
@@ -353,6 +371,10 @@ static void process_remote_commands(void) {
                     response_packet);
                 break;
             }
+            case RF_COMMAND_PING:
+                protocol_encode_ack(station_id, command.command,
+                                    command.argument, response_packet);
+                break;
             case RF_COMMAND_MOVE:
                 context->move_value = command.argument;
                 protocol_encode_ack(station_id, command.command,
@@ -369,7 +391,7 @@ static void process_remote_commands(void) {
         }
 
         if (!response_ready) {
-            printf("UNKNOWN command=0x%02X arg=%d\r\n",
+            printf("[%d] UNKNOWN command=0x%02X arg=%d\r\n", recv_cmd_nums,
                    command.command, command.argument);
             continue;
         }
@@ -385,8 +407,8 @@ static void process_remote_commands(void) {
             ++context->response_tx_failed;
         }
 
-        printf("RECEIVED command=0x%02X arg=%d response=%s "
-               "hw_retry=%u\r\n",
+        printf("[%d] RECEIVED command=0x%02X arg=%d response=%s "
+               "hw_retry=%u\r\n", recv_cmd_nums,
                command.command, command.argument,
                send_result_text(report.result),
                report.retransmit_count);
@@ -437,8 +459,12 @@ static void print_help(void) {
     printf("  status all   Show all used remote contexts\r\n");
     printf("  stats reset  Clear communication statistics\r\n");
     printf("  scan         Measure local RF energy on channels 0..125\r\n");
+    printf("  power N      TX power 0..3: 0=min (default), 3=max\r\n");
     if (role == ROLE_BASE) {
         printf("  select N     Select remote ID 1..16\r\n");
+        printf("  ping         Ping selected remote once\r\n");
+        printf("  poll on|off  Enable or disable periodic ping\r\n");
+        printf("  period MS    Set periodic ping interval 100..60000\r\n");
         printf("  getstat      Request selected remote status\r\n");
         printf("  move N       Set signed movement value -127..127\r\n");
         printf("  stop         Stop selected remote movement\r\n");
@@ -447,11 +473,13 @@ static void print_help(void) {
 
 static void print_status(bool all_contexts) {
     printf("Role=%s station_id=%u radio_config=%s channel=%u "
-           "RF_SETUP=0x%02X STATUS=0x%02X RX valid=%lu invalid=%lu "
+           "power=%u RF_SETUP=0x%02X STATUS=0x%02X "
+           "RX valid=%lu invalid=%lu "
            "invalid_source=%lu\r\n",
            role == ROLE_BASE ? "base" : "remote", station_id,
            nrf24_check_config(&radio, RF_CHANNEL) ? "ok" : "fault",
-           nrf24_read_channel(&radio), nrf24_read_rf_setup(&radio),
+           nrf24_read_channel(&radio), nrf24_get_tx_power(&radio),
+           nrf24_read_rf_setup(&radio),
            nrf24_read_status(&radio),
            (unsigned long)station_stats.rx_valid,
            (unsigned long)station_stats.rx_invalid,
@@ -464,7 +492,10 @@ static void print_status(bool all_contexts) {
     }
 
     if (!all_contexts) {
-        printf("Selected remote=%u\r\n", selected_remote_id);
+        printf("Selected remote=%u poll=%s period_ms=%lu\r\n",
+               selected_remote_id,
+               periodic_poll_enabled ? "on" : "off",
+               (unsigned long)periodic_poll_ms);
         print_remote_context(
             selected_remote_id,
             remote_context(selected_remote_id));
@@ -563,6 +594,21 @@ static void scan_rf_channels(void) {
     printf("RF scan complete; restored channel %u\r\n", RF_CHANNEL);
 }
 
+static void service_periodic_ping(void) {
+    if (role != ROLE_BASE || !periodic_poll_enabled ||
+        !time_reached(next_periodic_ping)) {
+        return;
+    }
+
+    remote_context_t *context =
+        remote_context(selected_remote_id);
+    if (!context->pending.waiting) {
+        send_command(selected_remote_id, RF_COMMAND_PING, 0);
+    }
+    next_periodic_ping =
+        make_timeout_time_ms(periodic_poll_ms);
+}
+
 static void process_command_line(char *line) {
     if (strcmp(line, "help") == 0) {
         print_help();
@@ -575,6 +621,43 @@ static void process_command_line(char *line) {
         printf("Statistics reset\r\n");
     } else if (strcmp(line, "scan") == 0) {
         scan_rf_channels();
+    } else if (strncmp(line, "power ", 6) == 0) {
+        unsigned int value = 0;
+        char extra = '\0';
+        if (sscanf(line + 6, "%u %c", &value, &extra) == 1 &&
+            value <= 3) {
+            nrf24_set_tx_power(&radio, (uint8_t)value);
+            printf("TX power=%u (%s)\r\n", value,
+                   value == 0 ? "minimum"
+                              : value == 3 ? "maximum"
+                                           : "intermediate");
+        } else {
+            printf("Power must be 0..3\r\n");
+        }
+    } else if (role == ROLE_BASE && strcmp(line, "ping") == 0) {
+        send_command(selected_remote_id, RF_COMMAND_PING, 0);
+    } else if (role == ROLE_BASE && strcmp(line, "poll on") == 0) {
+        periodic_poll_enabled = true;
+        next_periodic_ping = get_absolute_time();
+        printf("Periodic ping enabled: remote=%u period_ms=%lu\r\n",
+               selected_remote_id,
+               (unsigned long)periodic_poll_ms);
+    } else if (role == ROLE_BASE && strcmp(line, "poll off") == 0) {
+        periodic_poll_enabled = false;
+        printf("Periodic ping disabled\r\n");
+    } else if (role == ROLE_BASE &&
+               strncmp(line, "period ", 7) == 0) {
+        unsigned int value = 0;
+        char extra = '\0';
+        if (sscanf(line + 7, "%u %c", &value, &extra) == 1 &&
+            value >= MIN_POLL_PERIOD_MS &&
+            value <= MAX_POLL_PERIOD_MS) {
+            periodic_poll_ms = value;
+            next_periodic_ping = make_timeout_time_ms(value);
+            printf("Periodic ping period=%u ms\r\n", value);
+        } else {
+            printf("Period must be 100..60000 ms\r\n");
+        }
     } else if (role == ROLE_BASE && strcmp(line, "getstat") == 0) {
         send_command(selected_remote_id, RF_COMMAND_GETSTAT, 0);
     } else if (role == ROLE_BASE && strcmp(line, "stop") == 0) {
@@ -679,6 +762,7 @@ int main(void) {
         if (role == ROLE_BASE) {
             process_base_responses();
             process_base_timeouts();
+            service_periodic_ping();
         } else {
             process_remote_commands();
         }

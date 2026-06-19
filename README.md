@@ -261,6 +261,7 @@ Command IDs:
 
 ```text
 0x01  GETSTAT
+0x02  PING
 0x0A  MOVE
 0x0B  STOP
 0xF0..0xFF  ACK marker and encoded source remote ID
@@ -297,6 +298,11 @@ status
 status all
 stats reset
 select 1
+ping
+poll on
+poll off
+period 500
+power 0
 getstat
 move 1
 move -20
@@ -309,6 +315,33 @@ transmitted. The base accepts an ACK only when its command ID and argument
 match the outstanding command. `getstat` instead returns the data block
 described above. If no matching response arrives within 150 milliseconds, the
 base prints `CONNECTION LOST`.
+
+`ping` sends command ID `0x02` to the selected remote and prints the measured
+application response latency in microseconds:
+
+```text
+PING remote=1 latency_us=1340
+```
+
+Periodic ping is disabled after power-up. `poll on` enables periodic ping to
+the currently selected remote, and `poll off` disables it. The default period
+is 500 milliseconds. `period MS` changes it within the range 100 through
+60000 milliseconds. A periodic cycle is skipped if that remote already has a
+pending command.
+
+`power N` changes the local station's nRF24 transmit power at runtime:
+
+```text
+power 0   Minimum transmit power; startup default
+power 1   Intermediate level
+power 2   Intermediate level
+power 3   Maximum transmit power
+```
+
+The setting affects only transmissions from the station where the command is
+entered; no reboot is required. The E01 module includes an external power
+amplifier, so higher levels increase supply-current demand significantly.
+`status` prints the current logical level and raw `RF_SETUP` register.
 
 `status` reports the selected remote context. `status all` reports every
 remote context that has been used. Statistics include hardware retransmissions,
