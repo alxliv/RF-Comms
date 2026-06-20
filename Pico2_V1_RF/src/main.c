@@ -739,10 +739,13 @@ int main(void) {
         }
     }
 
+    nrf24_set_tx_power(&radio, 2);
+
     printf("\r\nPico2 V1 RF command protocol\r\n");
     printf("Role: %s\r\n", role == ROLE_BASE ? "base" : "remote");
     printf("Station ID: %u\r\n", station_id);
     printf("Radio: %s\r\n", radio_found ? "detected" : "not detected");
+    printf("TX_Power: %u\r\n", nrf24_get_tx_power(&radio));
 
     if (!radio_found) {
         printf("Check E01 power, ground, and SPI wiring.\r\n");
