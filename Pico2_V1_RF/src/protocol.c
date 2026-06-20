@@ -101,7 +101,8 @@ bool protocol_decode_response(const uint8_t packet[RF_PACKET_SIZE],
     response->argument = (int8_t)packet[2];
     response->data_length = 0;
 
-    if (response->command == RF_COMMAND_GETSTAT) {
+    if (response->command == RF_COMMAND_GETSTAT ||
+        response->command == RF_COMMAND_GETVER) {
         response->data_length = packet[2];
         if (response->data_length > RF_RESPONSE_DATA_MAX) {
             return false;

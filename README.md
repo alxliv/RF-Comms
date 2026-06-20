@@ -16,6 +16,7 @@ Connections are:
 *   GP14 = CE       GP15 = IRQ (reserved, unused)
 *   GP20 = role strap: high = base, low = remote
 *   GP10..GP13 = remote/device ID bits, internal pulldowns, id = bits + 1
+*   GP2 = remote range-test LED output, active high, use a series resistor
 
 Read document: **E01-2G4M27D\_Usermanual\_EN\_v1.3.pdf**
 [E01-2G4M27D\_Usermanual\_EN\_v1.3.pdf](./E01-2G4M27D_Usermanual_EN_v1.3.pdf)
@@ -244,8 +245,11 @@ Bytes 30-31 CRC16-CCITT, little-endian
 ```
 
 The current `getstat` data is 11 bytes: signed movement value, 32-bit uptime in
-seconds, 32-bit received-command count, last command ID, and radio
-configuration status. The source remote ID is decoded from byte 0.
+seconds, 32-bit received-command count, last command ID, and remote TX power
+level. The source remote ID is decoded from byte 0.
+
+`getver N` uses the same data-response format with command ID `0x03`. Its
+two-byte data contains the major and minor firmware version of remote `N`.
 
 The base allocates 16 independent remote contexts. Each context stores its
 pending command, timeout, connected state, movement/status data, hardware retry
@@ -262,6 +266,7 @@ Command IDs:
 ```text
 0x01  GETSTAT
 0x02  PING
+0x03  GETVER
 0x0A  MOVE
 0x0B  STOP
 0xF0..0xFF  ACK marker and encoded source remote ID
@@ -289,11 +294,15 @@ Pico2_V1_RF/build-release/pico2_v1_rf.uf2
 ```
 
 Flash the V1 UF2 onto both boards. The role and remote ID straps are unchanged.
+Both roles wait up to five seconds at startup for a USB CDC terminal. A remote
+continues silently if none connects. A base without a terminal stops and
+signals the error with two quick onboard-LED flashes each second.
 
 Base USB commands:
 
 ```text
 help
+version
 status
 status all
 stats reset
@@ -304,6 +313,7 @@ poll off
 period 500
 power 0
 getstat
+getver 1
 move 1
 move -20
 stop
@@ -316,12 +326,20 @@ match the outstanding command. `getstat` instead returns the data block
 described above. If no matching response arrives within 150 milliseconds, the
 base prints `CONNECTION LOST`.
 
-`ping` sends command ID `0x02` to the selected remote and prints the measured
-application response latency in microseconds:
+`ping` sends command ID `0x02` to the selected remote with that remote's
+8-bit ping sequence number. Each sequence starts at zero when the base starts
+and advances only after the base receives a matching response:
 
 ```text
-PING remote=1 latency_us=1340
+PING remote=1 sequence=0 latency_us=1340
 ```
+
+If a remote receives the same sequence again, it knows the previous
+application response was not received by the base. The remote raises its local
+TX power by one level, up to level 3, before sending the repeated response.
+On a new sequence, the remote pulses the GP2 range-test LED for 100
+milliseconds. On a repeated sequence, it holds the LED on until a new sequence
+arrives. The LED is off after remote startup until the first ping.
 
 Periodic ping is disabled after power-up. `poll on` enables periodic ping to
 the currently selected remote, and `poll off` disables it. The default period

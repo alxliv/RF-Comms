@@ -9,7 +9,27 @@
 #include "pico/stdlib.h"
 #include "protocol.h"
 
+static bool usb_off;
+
+#define PRINTF(...)             \
+    do {                        \
+        if (!usb_off) {         \
+            printf(__VA_ARGS__); \
+        }                       \
+    } while (0)
+
+typedef struct {
+    uint8_t major;
+    uint8_t minor;
+} firmware_version_t;
+
+static const firmware_version_t firmware_version = {
+    .major = 0,
+    .minor = 2,
+};
+
 enum {
+    PIN_RANGE_LED = 2,
     PIN_ID_BIT_0 = 10,
     PIN_ID_BIT_1 = 11,
     PIN_ID_BIT_2 = 12,
@@ -30,13 +50,16 @@ enum {
     DEFAULT_REMOTE_ID = 1,
     COMMAND_TIMEOUT_MS = 150,
     AUTO_ACK_GUARD_US = 500,
+    RANGE_LED_PULSE_MS = 100,
     GETSTAT_DATA_SIZE = 11,
+    GETVER_DATA_SIZE = 2,
     DEFAULT_POLL_PERIOD_MS = 500,
     MIN_POLL_PERIOD_MS = 100,
     MAX_POLL_PERIOD_MS = 60000,
     RF_CHANNEL_COUNT = 126,
     RF_SCAN_SAMPLES = 16,
 };
+
 
 typedef enum {
     ROLE_REMOTE = 0,
@@ -60,7 +83,8 @@ typedef struct {
     bool status_valid;
     uint32_t reported_uptime_s;
     uint32_t reported_commands_received;
-    bool reported_radio_ok;
+    uint8_t reported_tx_power;
+    uint8_t ping_seq_n;
 
     uint32_t hardware_tx_ok;
     uint32_t hardware_tx_failed;
@@ -90,12 +114,31 @@ static uint8_t selected_remote_id = DEFAULT_REMOTE_ID;
 static bool periodic_poll_enabled;
 static uint32_t periodic_poll_ms = DEFAULT_POLL_PERIOD_MS;
 static absolute_time_t next_periodic_ping;
+static bool range_led_pulse_active;
+static absolute_time_t range_led_off_time;
 
 static remote_context_t *remote_context(uint8_t remote_id) {
     if (remote_id < MIN_REMOTE_ID || remote_id > MAX_REMOTE_ID) {
         return NULL;
     }
     return &remote_contexts[remote_id - 1u];
+}
+
+static void update_range_led(bool repeated_ping) {
+    gpio_put(PIN_RANGE_LED, true);
+    range_led_pulse_active = !repeated_ping;
+    if (range_led_pulse_active) {
+        range_led_off_time =
+            make_timeout_time_ms(RANGE_LED_PULSE_MS);
+    }
+}
+
+static void service_range_led(void) {
+    if (range_led_pulse_active &&
+        time_reached(range_led_off_time)) {
+        gpio_put(PIN_RANGE_LED, false);
+        range_led_pulse_active = false;
+    }
 }
 
 static station_role_t read_role(void) {
@@ -184,7 +227,7 @@ static bool send_command(uint8_t remote_id, uint8_t command,
         return false;
     }
     if (context->pending.waiting) {
-        printf("Remote %u already has a pending command\r\n", remote_id);
+        PRINTF("Remote %u already has a pending command\r\n", remote_id);
         return false;
     }
     send_cmd_nums++;
@@ -205,10 +248,17 @@ static bool send_command(uint8_t remote_id, uint8_t command,
         transmit(remote_id, context, packet);
     start_station_receiver();
 
-    printf("[%d] COMMAND remote=%u id=0x%02X arg=%d radio=%s hw_retry=%u\r\n", send_cmd_nums,
+    PRINTF("[%d] COMMAND remote=%u id=0x%02X arg=%d radio=%s hw_retry=%u\r\n", send_cmd_nums,
            remote_id, command, argument,
            send_result_text(report.result), report.retransmit_count);
     return true;
+}
+
+static bool send_ping(uint8_t remote_id) {
+    remote_context_t *context = remote_context(remote_id);
+    return context != NULL &&
+           send_command(remote_id, RF_COMMAND_PING,
+                        (int8_t)context->ping_seq_n);
 }
 
 static uint32_t read_u32_le(const uint8_t *data) {
@@ -228,7 +278,7 @@ static void write_u32_le(uint8_t *data, uint32_t value) {
 static void update_getstat_context(remote_context_t *context,
                                    const rf_response_t *response) {
     if (response->data_length != GETSTAT_DATA_SIZE) {
-        printf("GETSTAT remote=%u invalid data length=%u\r\n",
+        PRINTF("GETSTAT remote=%u invalid data length=%u\r\n",
                response->source_id, response->data_length);
         return;
     }
@@ -238,16 +288,26 @@ static void update_getstat_context(remote_context_t *context,
     context->reported_commands_received =
         read_u32_le(&response->data[5]);
     context->last_command = response->data[9];
-    context->reported_radio_ok = response->data[10] != 0;
+    context->reported_tx_power = response->data[10];
     context->status_valid = true;
 
-    printf("GETSTAT remote=%u move=%d uptime_s=%lu "
-           "commands_received=%lu last_command=0x%02X radio=%s\r\n",
+    PRINTF("GETSTAT remote=%u move=%d uptime_s=%lu "
+           "commands_received=%lu last_command=0x%02X tx_power=%u\r\n",
            response->source_id, context->move_value,
            (unsigned long)context->reported_uptime_s,
            (unsigned long)context->reported_commands_received,
-           context->last_command,
-           context->reported_radio_ok ? "ok" : "fault");
+           context->last_command, context->reported_tx_power);
+}
+
+static void print_remote_version(const rf_response_t *response) {
+    if (response->data_length != GETVER_DATA_SIZE) {
+        PRINTF("GETVER remote=%u invalid data length=%u\r\n",
+               response->source_id, response->data_length);
+        return;
+    }
+
+    PRINTF("GETVER remote=%u version=%u.%u\r\n",
+           response->source_id, response->data[0], response->data[1]);
 }
 
 static void process_base_responses(void) {
@@ -272,6 +332,7 @@ static void process_base_responses(void) {
         if (!context->pending.waiting ||
             response.command != context->pending.command.command ||
             (response.command != RF_COMMAND_GETSTAT &&
+             response.command != RF_COMMAND_GETVER &&
              response.argument !=
                  context->pending.command.argument)) {
             ++context->unexpected_responses;
@@ -290,6 +351,8 @@ static void process_base_responses(void) {
 
         if (response.command == RF_COMMAND_GETSTAT) {
             update_getstat_context(context, &response);
+        } else if (response.command == RF_COMMAND_GETVER) {
+            print_remote_version(&response);
         } else {
             context->last_command = response.command;
             if (response.command == RF_COMMAND_MOVE) {
@@ -298,11 +361,14 @@ static void process_base_responses(void) {
                 context->move_value = 0;
             }
             if (response.command == RF_COMMAND_PING) {
-                printf("PING remote=%u latency_us=%lu\r\n",
-                       response.source_id,
+                const uint8_t ping_seq_n =
+                    (uint8_t)response.argument;
+                ++context->ping_seq_n;
+                PRINTF("PING remote=%u sequence=%u latency_us=%lu\r\n",
+                       response.source_id, ping_seq_n,
                        (unsigned long)response_us);
             } else {
-                printf("ACK remote=%u command=0x%02X arg=%d "
+                PRINTF("ACK remote=%u command=0x%02X arg=%d "
                        "response_us=%lu\r\n",
                        response.source_id, response.command,
                        response.argument, (unsigned long)response_us);
@@ -322,7 +388,7 @@ static void process_base_timeouts(void) {
         ++context->command_timeouts;
         context->connected = false;
         context->pending.waiting = false;
-        printf("CONNECTION LOST remote=%u command=0x%02X "
+        PRINTF("CONNECTION LOST remote=%u command=0x%02X "
                "timeout_ms=%u\r\n",
                (unsigned int)(index + 1u),
                context->pending.command.command,
@@ -338,7 +404,7 @@ static void build_getstat_data(const remote_context_t *context,
                             1000u));
     write_u32_le(&data[5], context->commands_received);
     data[9] = context->last_command;
-    data[10] = nrf24_check_config(&radio, RF_CHANNEL) ? 1 : 0;
+    data[10] = nrf24_get_tx_power(&radio);
 }
 
 static int recv_cmd_nums = 0;
@@ -371,10 +437,35 @@ static void process_remote_commands(void) {
                     response_packet);
                 break;
             }
-            case RF_COMMAND_PING:
+            case RF_COMMAND_GETVER: {
+                const uint8_t data[GETVER_DATA_SIZE] = {
+                    firmware_version.major,
+                    firmware_version.minor,
+                };
+                response_ready = protocol_encode_data_response(
+                    station_id, command.command, data, sizeof(data),
+                    response_packet);
+                break;
+            }
+            case RF_COMMAND_PING: {
+                const uint8_t ping_seq_n =
+                    (uint8_t)command.argument;
+                const bool repeated_ping =
+                    ping_seq_n == context->ping_seq_n;
+                update_range_led(repeated_ping);
+                if (repeated_ping) {
+                    const uint8_t tx_power =
+                        nrf24_get_tx_power(&radio);
+                    if (tx_power < 2) {
+                        nrf24_set_tx_power(&radio,
+                                           (uint8_t)(tx_power + 1u));
+                    }
+                }
+                context->ping_seq_n = ping_seq_n;
                 protocol_encode_ack(station_id, command.command,
                                     command.argument, response_packet);
                 break;
+            }
             case RF_COMMAND_MOVE:
                 context->move_value = command.argument;
                 protocol_encode_ack(station_id, command.command,
@@ -391,7 +482,7 @@ static void process_remote_commands(void) {
         }
 
         if (!response_ready) {
-            printf("[%d] UNKNOWN command=0x%02X arg=%d\r\n", recv_cmd_nums,
+            PRINTF("[%d] UNKNOWN command=0x%02X arg=%d\r\n", recv_cmd_nums,
                    command.command, command.argument);
             continue;
         }
@@ -407,11 +498,12 @@ static void process_remote_commands(void) {
             ++context->response_tx_failed;
         }
 
-        printf("[%d] RECEIVED command=0x%02X arg=%d response=%s "
-               "hw_retry=%u\r\n", recv_cmd_nums,
+        PRINTF("[%d] RECEIVED command=0x%02X arg=%d response=%s "
+               "hw_retry=%u tx_power=%u\r\n", recv_cmd_nums,
                command.command, command.argument,
                send_result_text(report.result),
-               report.retransmit_count);
+               report.retransmit_count,
+               nrf24_get_tx_power(&radio));
     }
 }
 
@@ -423,12 +515,12 @@ static void print_remote_context(uint8_t remote_id,
             : (uint32_t)(context->total_response_us /
                          context->commands_acked);
 
-    printf("Remote=%u connected=%s waiting=%s move=%d "
+    PRINTF("Remote=%u connected=%s waiting=%s move=%d "
            "last_command=0x%02X\r\n",
            remote_id, context->connected ? "yes" : "no",
            context->pending.waiting ? "yes" : "no",
            context->move_value, context->last_command);
-    printf("  HW tx_ok=%lu failed=%lu retransmits=%lu "
+    PRINTF("  HW tx_ok=%lu failed=%lu retransmits=%lu "
            "commands sent=%lu acked=%lu timeouts=%lu received=%lu\r\n",
            (unsigned long)context->hardware_tx_ok,
            (unsigned long)context->hardware_tx_failed,
@@ -437,42 +529,44 @@ static void print_remote_context(uint8_t remote_id,
            (unsigned long)context->commands_acked,
            (unsigned long)context->command_timeouts,
            (unsigned long)context->commands_received);
-    printf("  response_tx_failed=%lu unexpected=%lu "
+    PRINTF("  response_tx_failed=%lu unexpected=%lu "
            "response average_us=%lu maximum_us=%lu\r\n",
            (unsigned long)context->response_tx_failed,
            (unsigned long)context->unexpected_responses,
            (unsigned long)average_response_us,
            (unsigned long)context->maximum_response_us);
     if (context->status_valid) {
-        printf("  reported uptime_s=%lu commands_received=%lu "
-               "radio=%s\r\n",
+        PRINTF("  reported uptime_s=%lu commands_received=%lu "
+               "tx_power=%u\r\n",
                (unsigned long)context->reported_uptime_s,
                (unsigned long)context->reported_commands_received,
-               context->reported_radio_ok ? "ok" : "fault");
+               context->reported_tx_power);
     }
 }
 
 static void print_help(void) {
-    printf("Commands:\r\n");
-    printf("  help         Show commands\r\n");
-    printf("  status       Show selected remote and radio status\r\n");
-    printf("  status all   Show all used remote contexts\r\n");
-    printf("  stats reset  Clear communication statistics\r\n");
-    printf("  scan         Measure local RF energy on channels 0..125\r\n");
-    printf("  power N      TX power 0..3: 0=min (default), 3=max\r\n");
+    PRINTF("Commands:\r\n");
+    PRINTF("  help         Show commands\r\n");
+    PRINTF("  version      Show firmware version\r\n");
+    PRINTF("  status       Show selected remote and radio status\r\n");
+    PRINTF("  status all   Show all used remote contexts\r\n");
+    PRINTF("  stats reset  Clear communication statistics\r\n");
+    PRINTF("  scan         Measure local RF energy on channels 0..125\r\n");
+    PRINTF("  power N      TX power 0..3: 0=min (default), 3=max\r\n");
     if (role == ROLE_BASE) {
-        printf("  select N     Select remote ID 1..16\r\n");
-        printf("  ping         Ping selected remote once\r\n");
-        printf("  poll on|off  Enable or disable periodic ping\r\n");
-        printf("  period MS    Set periodic ping interval 100..60000\r\n");
-        printf("  getstat      Request selected remote status\r\n");
-        printf("  move N       Set signed movement value -127..127\r\n");
-        printf("  stop         Stop selected remote movement\r\n");
+        PRINTF("  select N     Select remote ID 1..16\r\n");
+        PRINTF("  ping         Ping selected remote once\r\n");
+        PRINTF("  poll on|off  Enable or disable periodic ping\r\n");
+        PRINTF("  period MS    Set periodic ping interval 100..60000\r\n");
+        PRINTF("  getstat      Request selected remote status\r\n");
+        PRINTF("  getver N     Request firmware version from remote N\r\n");
+        PRINTF("  move N       Set signed movement value -127..127\r\n");
+        PRINTF("  stop         Stop selected remote movement\r\n");
     }
 }
 
 static void print_status(bool all_contexts) {
-    printf("Role=%s station_id=%u radio_config=%s channel=%u "
+    PRINTF("Role=%s station_id=%u radio_config=%s channel=%u "
            "power=%u RF_SETUP=0x%02X STATUS=0x%02X "
            "RX valid=%lu invalid=%lu "
            "invalid_source=%lu\r\n",
@@ -492,7 +586,7 @@ static void print_status(bool all_contexts) {
     }
 
     if (!all_contexts) {
-        printf("Selected remote=%u poll=%s period_ms=%lu\r\n",
+        PRINTF("Selected remote=%u poll=%s period_ms=%lu\r\n",
                selected_remote_id,
                periodic_poll_enabled ? "on" : "off",
                (unsigned long)periodic_poll_ms);
@@ -546,11 +640,11 @@ static void scan_rf_channels(void) {
     uint8_t peak_hits = 0;
 
     if (role == ROLE_BASE && any_command_pending()) {
-        printf("Cannot scan while commands are pending\r\n");
+        PRINTF("Cannot scan while commands are pending\r\n");
         return;
     }
 
-    printf("RF scan start: %u samples/channel, 10 ms/sample, "
+    PRINTF("RF scan start: %u samples/channel, 10 ms/sample, "
            "RPD threshold approximately -64 dBm\r\n",
            RF_SCAN_SAMPLES);
 
@@ -573,25 +667,25 @@ static void scan_rf_channels(void) {
             ((uint32_t)detected[channel] * 100u +
              RF_SCAN_SAMPLES / 2u) /
             RF_SCAN_SAMPLES;
-        printf("channel=%3u frequency=%4uMHz noise=%3lu%% "
+        PRINTF("channel=%3u frequency=%4uMHz noise=%3lu%% "
                "hits=%u/%u\r\n",
                channel, 2400u + channel,
                (unsigned long)noise_percent, detected[channel],
                RF_SCAN_SAMPLES);
     }
     if (occupied_channels == 0) {
-        printf("RF scan summary: no energy above the RPD threshold "
+        PRINTF("RF scan summary: no energy above the RPD threshold "
                "was detected\r\n");
     } else {
         const uint32_t peak_percent =
             ((uint32_t)peak_hits * 100u + RF_SCAN_SAMPLES / 2u) /
             RF_SCAN_SAMPLES;
-        printf("RF scan summary: occupied_channels=%u "
+        PRINTF("RF scan summary: occupied_channels=%u "
                "peak_channel=%u peak_noise=%lu%%\r\n",
                occupied_channels, peak_channel,
                (unsigned long)peak_percent);
     }
-    printf("RF scan complete; restored channel %u\r\n", RF_CHANNEL);
+    PRINTF("RF scan complete; restored channel %u\r\n", RF_CHANNEL);
 }
 
 static void service_periodic_ping(void) {
@@ -603,7 +697,7 @@ static void service_periodic_ping(void) {
     remote_context_t *context =
         remote_context(selected_remote_id);
     if (!context->pending.waiting) {
-        send_command(selected_remote_id, RF_COMMAND_PING, 0);
+        send_ping(selected_remote_id);
     }
     next_periodic_ping =
         make_timeout_time_ms(periodic_poll_ms);
@@ -612,13 +706,16 @@ static void service_periodic_ping(void) {
 static void process_command_line(char *line) {
     if (strcmp(line, "help") == 0) {
         print_help();
+    } else if (strcmp(line, "version") == 0) {
+        PRINTF("Firmware version %u.%u\r\n", firmware_version.major,
+               firmware_version.minor);
     } else if (strcmp(line, "status") == 0) {
         print_status(false);
     } else if (strcmp(line, "status all") == 0) {
         print_status(true);
     } else if (strcmp(line, "stats reset") == 0) {
         reset_statistics();
-        printf("Statistics reset\r\n");
+        PRINTF("Statistics reset\r\n");
     } else if (strcmp(line, "scan") == 0) {
         scan_rf_channels();
     } else if (strncmp(line, "power ", 6) == 0) {
@@ -627,24 +724,24 @@ static void process_command_line(char *line) {
         if (sscanf(line + 6, "%u %c", &value, &extra) == 1 &&
             value <= 3) {
             nrf24_set_tx_power(&radio, (uint8_t)value);
-            printf("TX power=%u (%s)\r\n", value,
+            PRINTF("TX power=%u (%s)\r\n", value,
                    value == 0 ? "minimum"
                               : value == 3 ? "maximum"
                                            : "intermediate");
         } else {
-            printf("Power must be 0..3\r\n");
+            PRINTF("Power must be 0..3\r\n");
         }
     } else if (role == ROLE_BASE && strcmp(line, "ping") == 0) {
-        send_command(selected_remote_id, RF_COMMAND_PING, 0);
+        send_ping(selected_remote_id);
     } else if (role == ROLE_BASE && strcmp(line, "poll on") == 0) {
         periodic_poll_enabled = true;
         next_periodic_ping = get_absolute_time();
-        printf("Periodic ping enabled: remote=%u period_ms=%lu\r\n",
+        PRINTF("Periodic ping enabled: remote=%u period_ms=%lu\r\n",
                selected_remote_id,
                (unsigned long)periodic_poll_ms);
     } else if (role == ROLE_BASE && strcmp(line, "poll off") == 0) {
         periodic_poll_enabled = false;
-        printf("Periodic ping disabled\r\n");
+        PRINTF("Periodic ping disabled\r\n");
     } else if (role == ROLE_BASE &&
                strncmp(line, "period ", 7) == 0) {
         unsigned int value = 0;
@@ -654,12 +751,22 @@ static void process_command_line(char *line) {
             value <= MAX_POLL_PERIOD_MS) {
             periodic_poll_ms = value;
             next_periodic_ping = make_timeout_time_ms(value);
-            printf("Periodic ping period=%u ms\r\n", value);
+            PRINTF("Periodic ping period=%u ms\r\n", value);
         } else {
-            printf("Period must be 100..60000 ms\r\n");
+            PRINTF("Period must be 100..60000 ms\r\n");
         }
     } else if (role == ROLE_BASE && strcmp(line, "getstat") == 0) {
         send_command(selected_remote_id, RF_COMMAND_GETSTAT, 0);
+    } else if (role == ROLE_BASE &&
+               strncmp(line, "getver ", 7) == 0) {
+        unsigned int value = 0;
+        char extra = '\0';
+        if (sscanf(line + 7, "%u %c", &value, &extra) == 1 &&
+            value >= MIN_REMOTE_ID && value <= MAX_REMOTE_ID) {
+            send_command((uint8_t)value, RF_COMMAND_GETVER, 0);
+        } else {
+            PRINTF("Remote ID must be 1..16\r\n");
+        }
     } else if (role == ROLE_BASE && strcmp(line, "stop") == 0) {
         send_command(selected_remote_id, RF_COMMAND_STOP, 0);
     } else if (role == ROLE_BASE &&
@@ -671,7 +778,7 @@ static void process_command_line(char *line) {
             send_command(selected_remote_id, RF_COMMAND_MOVE,
                          (int8_t)value);
         } else {
-            printf("Move value must be -127..127\r\n");
+            PRINTF("Move value must be -127..127\r\n");
         }
     } else if (role == ROLE_BASE &&
                strncmp(line, "select ", 7) == 0) {
@@ -680,12 +787,12 @@ static void process_command_line(char *line) {
         if (sscanf(line + 7, "%u %c", &value, &extra) == 1 &&
             value >= MIN_REMOTE_ID && value <= MAX_REMOTE_ID) {
             selected_remote_id = (uint8_t)value;
-            printf("Selected remote=%u\r\n", selected_remote_id);
+            PRINTF("Selected remote=%u\r\n", selected_remote_id);
         } else {
-            printf("Remote ID must be 1..16\r\n");
+            PRINTF("Remote ID must be 1..16\r\n");
         }
     } else if (line[0] != '\0') {
-        printf("Unknown command. Type 'help'.\r\n");
+        PRINTF("Unknown command. Type 'help'.\r\n");
     }
 }
 
@@ -715,6 +822,12 @@ int main(void) {
     stdio_init_all();
     role = read_role();
     station_id = role == ROLE_BASE ? BASE_STATION_ID : read_remote_id();
+    if (role == ROLE_REMOTE) {
+        remote_context(station_id)->ping_seq_n = UINT8_MAX;
+        gpio_init(PIN_RANGE_LED);
+        gpio_set_dir(PIN_RANGE_LED, GPIO_OUT);
+        gpio_put(PIN_RANGE_LED, false);
+    }
 
     gpio_init(PICO_DEFAULT_LED_PIN);
     gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
@@ -731,25 +844,40 @@ int main(void) {
         start_station_receiver();
     }
 
-    if (role == ROLE_BASE) {
-        for (uint32_t elapsed_ms = 0;
-             elapsed_ms < 3000u && !stdio_usb_connected();
-             elapsed_ms += 100u) {
-            sleep_ms(100);
+    for (uint32_t elapsed_ms = 0;
+         elapsed_ms < 5000u && !stdio_usb_connected();
+         elapsed_ms += 100u) {
+        sleep_ms(100);
+    }
+    usb_off = !stdio_usb_connected();
+    if (role == ROLE_BASE && usb_off) {
+        while (true) {
+            gpio_put(PICO_DEFAULT_LED_PIN, true);
+            sleep_ms(80);
+            gpio_put(PICO_DEFAULT_LED_PIN, false);
+            sleep_ms(80);
+            gpio_put(PICO_DEFAULT_LED_PIN, true);
+            sleep_ms(80);
+            gpio_put(PICO_DEFAULT_LED_PIN, false);
+            sleep_ms(760);
         }
     }
+    const uint8_t start_tx_power = role == ROLE_BASE ? 2 : 0;
 
-    nrf24_set_tx_power(&radio, 2);
+    nrf24_set_tx_power(&radio, start_tx_power);
 
-    printf("\r\nPico2 V1 RF command protocol\r\n");
-    printf("Role: %s\r\n", role == ROLE_BASE ? "base" : "remote");
-    printf("Station ID: %u\r\n", station_id);
-    printf("Radio: %s\r\n", radio_found ? "detected" : "not detected");
-    printf("TX_Power: %u\r\n", nrf24_get_tx_power(&radio));
+    PRINTF("\r\nPico2 V1 RF command protocol\r\n");
+    PRINTF("Firmware version: %u.%u\r\n", firmware_version.major,
+           firmware_version.minor);
+    PRINTF("Role: %s\r\n", role == ROLE_BASE ? "base" : "remote");
+    PRINTF("Station ID: %u\r\n", station_id);
+    PRINTF("Radio: %s\r\n", radio_found ? "detected" : "not detected");
+    PRINTF("TX_Power: %u\r\n", nrf24_get_tx_power(&radio));
 
     if (!radio_found) {
-        printf("Check E01 power, ground, and SPI wiring.\r\n");
+        PRINTF("Check E01 power, ground, and SPI wiring.\r\n");
         while (true) {
+            // Blink the onboard LED rapidly to indicate that the radio was not detected.
             gpio_xor_mask(1u << PICO_DEFAULT_LED_PIN);
             sleep_ms(100);
             poll_usb_commands();
@@ -768,6 +896,7 @@ int main(void) {
             service_periodic_ping();
         } else {
             process_remote_commands();
+            service_range_led();
         }
 
         if (time_reached(next_led_toggle)) {
