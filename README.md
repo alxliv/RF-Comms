@@ -391,3 +391,60 @@ receive address, and receive mode.
 An all-zero result means no signal crossed the approximately -64 dBm threshold
 during the observation windows. It does not prove that the band is free of
 weaker or very infrequent interference.
+
+## Pico2 V2 RF
+
+`Pico2_V2_RF` is the next firmware version. It targets a single Wanderer
+vehicle and will use nRF24 Enhanced ShockBurst ACK payloads for telemetry from
+the Wanderer to the base station.
+
+The current Step 1 scaffold:
+
+- Builds for Raspberry Pi Pico 2 (`RP2350`, ARM).
+- Uses C++17 and Raspberry Pi Pico SDK 2.2.0.
+- Includes RF24 v1.6.1 as a Git submodule under
+  `Pico2_V2_RF/lib/RF24`.
+- Initializes the RF24 library and reports whether the radio responds over
+  SPI.
+- Sends startup diagnostics through USB CDC.
+
+Current radio connections:
+
+```text
+GP14 = CE
+GP17 = CSN
+GP16 = MISO
+GP18 = SCK
+GP19 = MOSI
+```
+
+### Building Pico2 V2 RF
+
+Set `PICO_SDK_PATH` to the installed Pico SDK 2.2.0 location if it is not
+already defined. Run the following commands from the repository root in
+PowerShell:
+
+```powershell
+git submodule update --init --recursive
+
+$env:PICO_SDK_PATH = "$HOME\.pico-sdk\sdk\2.2.0"
+
+cmake -S Pico2_V2_RF `
+      -B Pico2_V2_RF/build-release `
+      -G Ninja `
+      -DPICO_BOARD=pico2 `
+      -DCMAKE_BUILD_TYPE=Release `
+      "-Dpicotool_DIR=$HOME\.pico-sdk\picotool\2.1.1\picotool"
+
+cmake --build Pico2_V2_RF/build-release --target pico2_v2_rf -j
+```
+
+The generated UF2 is:
+
+```text
+Pico2_V2_RF/build-release/pico2_v2_rf.uf2
+```
+
+The current firmware is only an RF24/Pico 2 compatibility smoke test. The
+ACK-payload protocol, telemetry frames, request/reply matching, and binary USB
+host protocol are not implemented yet.
