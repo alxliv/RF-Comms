@@ -2,6 +2,7 @@
 
 #include "RF24.h"
 #include "pico/stdlib.h"
+#include "protocol.h"
 
 namespace {
 

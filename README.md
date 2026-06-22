@@ -446,5 +446,45 @@ Pico2_V2_RF/build-release/pico2_v2_rf.uf2
 ```
 
 The current firmware is only an RF24/Pico 2 compatibility smoke test. The
-ACK-payload protocol, telemetry frames, request/reply matching, and binary USB
-host protocol are not implemented yet.
+ACK-payload radio transport, request/reply matching, and binary USB host
+protocol are not implemented yet.
+
+### V2 wire protocol
+
+`Pico2_V2_RF/src/protocol.h` defines the packed, little-endian payloads shared
+by the base, Wanderer, and future laptop software. Every payload fits within
+the nRF24 maximum of 32 bytes. Compile-time assertions verify the exact layout.
+
+Command identifiers:
+
+```text
+0x00  NOP
+0x10  STOP
+0x11  ARM
+0x12  MOVE
+0x20  GETVER
+0x30  SETPARAM
+```
+
+Reply identifiers:
+
+```text
+0x00  Link lost
+0x01  Telemetry V1
+0x02  Firmware version
+0x03  Request timeout
+```
+
+Payload layouts:
+
+```text
+Command header       2 bytes: type, sequence
+MOVE command         6 bytes: type, sequence, left velocity, right velocity
+SETPARAM command     7 bytes: type, sequence, parameter ID, signed value
+Telemetry V1        25 bytes: <BBBHBhhhhiiHB
+Firmware version    15 bytes: <BBBBBBIIB
+```
+
+All multi-byte fields are little-endian. The radio link relies on the nRF24
+two-byte hardware CRC and hardware retransmission; V2 does not add another CRC
+inside the radio payload.
