@@ -68,21 +68,15 @@ struct __attribute__((packed)) TelemetryV1 {
 
 struct __attribute__((packed)) VersionReply {
     uint8_t type;
-    uint8_t sequence;
     uint8_t firmware_major;
     uint8_t firmware_minor;
-    uint8_t firmware_patch;
-    uint8_t protocol_version;
-    uint32_t git_hash;
-    uint32_t build_date;
-    uint8_t hardware_id;
 };
 
 static_assert(sizeof(CommandHeader) == 2);
 static_assert(sizeof(MoveCommand) == 6);
 static_assert(sizeof(SetParameterCommand) == 7);
 static_assert(sizeof(TelemetryV1) == 25);
-static_assert(sizeof(VersionReply) == 15);
+static_assert(sizeof(VersionReply) == 3);
 
 static_assert(sizeof(CommandHeader) <= MAX_PAYLOAD_SIZE);
 static_assert(sizeof(MoveCommand) <= MAX_PAYLOAD_SIZE);

@@ -15,12 +15,17 @@ constexpr uint8_t PIN_RF_SCK = 18;
 constexpr uint8_t PIN_RF_MOSI = 19;
 constexpr uint8_t PIN_ROLE = 20;
 
+// Both boards run the same firmware. GP20 selects what this board does:
+// high = laptop-side base, low = vehicle-side Wanderer.
 constexpr uint8_t RADIO_CHANNEL = 76;
 constexpr uint8_t RADIO_PIPE = 1;
 constexpr uint32_t POLL_PERIOD_MS = 10;
+// If the Wanderer hears no valid command for this long, it stops locally.
+// The base cannot receive that fact while the RF link is down; it reports
+// link loss immediately and confirms the emergency-stop state after recovery.
 constexpr uint32_t LINK_TIMEOUT_MS = 200;
 constexpr uint32_t RADIO_HEALTH_PERIOD_MS = 1000;
-constexpr uint32_t REQUEST_REARM_MS = 20;
+constexpr uint32_t TELEMETRY_REPORT_MS = 5000;
 constexpr uint32_t REQUEST_TIMEOUT_MS = 500;
 constexpr uint32_t ARM_CONFIRM_TIMEOUT_MS = 500;
 constexpr size_t COMMAND_LINE_SIZE = 64;
@@ -28,28 +33,23 @@ constexpr uint8_t RADIO_ADDRESS[5] = {'V', '2', 'R', 'F', '1'};
 
 constexpr uint8_t FIRMWARE_MAJOR = 0;
 constexpr uint8_t FIRMWARE_MINOR = 2;
-constexpr uint8_t FIRMWARE_PATCH = 0;
-constexpr uint8_t PROTOCOL_VERSION = 1;
-constexpr uint8_t HARDWARE_ID = 1;
-
-#ifndef FW_GIT_HASH
-#define FW_GIT_HASH 0x00000000u
-#endif
-
-#ifndef FW_BUILD_DATE
-#define FW_BUILD_DATE 0u
-#endif
 
 enum class Role : uint8_t {
     Wanderer,
     Base,
 };
 
+struct PendingReply {
+    bool active;
+    uint8_t type;
+};
+
 struct WandererState {
+    // These are currently command/telemetry state only. Real motor-control
+    // outputs and sensor readings will be connected later.
     bool armed;
     bool estop;
-    bool pending_version;
-    uint8_t pending_version_sequence;
+    PendingReply pending_reply;
     uint8_t telemetry_sequence;
     int16_t target_left_mm_s;
     int16_t target_right_mm_s;
@@ -57,11 +57,22 @@ struct WandererState {
 };
 
 struct BaseState {
+    // Command and telemetry sequence values are 8-bit and intentionally wrap
+    // from 255 back to 0.
     uint8_t command_sequence;
     bool link_up;
     bool arm_confirmation_pending;
+    bool telemetry_sequence_valid;
+    bool telemetry_flags_valid;
+    uint8_t last_telemetry_sequence;
     uint32_t telemetry_received;
+    uint32_t telemetry_received_at_report;
+    uint32_t telemetry_gaps;
+    uint32_t telemetry_gaps_at_report;
+    uint8_t last_telemetry_flags;
     absolute_time_t arm_confirmation_deadline;
+    absolute_time_t telemetry_report_started;
+    absolute_time_t next_telemetry_report;
     absolute_time_t next_poll;
 };
 
@@ -80,6 +91,7 @@ SPI radio_spi;
 namespace {
 
 Role read_role() {
+    // The pulldown makes an unconnected role pin safely select Wanderer.
     gpio_init(PIN_ROLE);
     gpio_set_dir(PIN_ROLE, GPIO_IN);
     gpio_pull_down(PIN_ROLE);
@@ -88,6 +100,9 @@ Role read_role() {
 }
 
 bool configure_radio(Role role) {
+    // Both roles must use identical Enhanced ShockBurst settings. Dynamic
+    // payloads are required because commands and ACK replies have different
+    // lengths.
     radio.setAddressWidth(sizeof(RADIO_ADDRESS));
     radio.setChannel(RADIO_CHANNEL);
     radio.setDataRate(RF24_1MBPS);
@@ -111,9 +126,16 @@ bool configure_radio(Role role) {
 }
 
 rf_protocol::TelemetryV1 build_telemetry(WandererState *state) {
+    // A telemetry packet is a complete snapshot, not a delta. Losing one
+    // packet does not make later packets impossible to decode.
     rf_protocol::TelemetryV1 telemetry{};
     telemetry.type = rf_protocol::REPLY_TELEMETRY_V1;
     telemetry.sequence = state->telemetry_sequence++;
+    if (state->armed &&
+        (state->target_left_mm_s != 0 ||
+         state->target_right_mm_s != 0)) {
+        telemetry.flags |= rf_protocol::FLAG_RUNNING;
+    }
     if (state->estop) {
         telemetry.flags |= rf_protocol::FLAG_ESTOP;
     }
@@ -122,26 +144,35 @@ rf_protocol::TelemetryV1 build_telemetry(WandererState *state) {
     return telemetry;
 }
 
-rf_protocol::VersionReply build_version_reply(uint8_t sequence) {
+rf_protocol::VersionReply build_version_reply() {
     rf_protocol::VersionReply reply{};
     reply.type = rf_protocol::REPLY_VERSION;
-    reply.sequence = sequence;
     reply.firmware_major = FIRMWARE_MAJOR;
     reply.firmware_minor = FIRMWARE_MINOR;
-    reply.firmware_patch = FIRMWARE_PATCH;
-    reply.protocol_version = PROTOCOL_VERSION;
-    reply.git_hash = FW_GIT_HASH;
-    reply.build_date = FW_BUILD_DATE;
-    reply.hardware_id = HARDWARE_ID;
     return reply;
 }
 
 bool stage_next_ack_payload(WandererState *state) {
-    if (state->pending_version) {
-        const rf_protocol::VersionReply reply =
-            build_version_reply(state->pending_version_sequence);
-        state->pending_version = false;
-        return radio.writeAckPayload(RADIO_PIPE, &reply, sizeof(reply));
+    // writeAckPayload() only queues data. The nRF24 sends it automatically
+    // with the ACK for the next command received on RADIO_PIPE.
+    //
+    // Important: the ACK for the command currently being read has already
+    // gone over the air. Therefore the payload staged here is always for the
+    // following base poll. This one-poll delay is normal.
+    if (state->pending_reply.active) {
+        state->pending_reply.active = false;
+
+        switch (state->pending_reply.type) {
+            case rf_protocol::REPLY_VERSION: {
+                const rf_protocol::VersionReply reply =
+                    build_version_reply();
+                return radio.writeAckPayload(
+                    RADIO_PIPE, &reply, sizeof(reply));
+            }
+
+            default:
+                break;
+        }
     }
 
     const rf_protocol::TelemetryV1 telemetry = build_telemetry(state);
@@ -151,6 +182,8 @@ bool stage_next_ack_payload(WandererState *state) {
 
 bool handle_wanderer_command(const uint8_t *payload, uint8_t length,
                              WandererState *state) {
+    // Never cast and trust arbitrary radio bytes. First verify the exact
+    // length, then copy into the packed protocol structure.
     if (length < sizeof(rf_protocol::CommandHeader)) {
         return false;
     }
@@ -169,6 +202,8 @@ bool handle_wanderer_command(const uint8_t *payload, uint8_t length,
             state->armed = false;
             state->target_left_mm_s = 0;
             state->target_right_mm_s = 0;
+            PRINTF("Command STOP seq=%u: disarmed, targets cleared\r\n",
+                   header.sequence);
             return true;
 
         case rf_protocol::CMD_ARM:
@@ -177,6 +212,8 @@ bool handle_wanderer_command(const uint8_t *payload, uint8_t length,
             }
             state->armed = true;
             state->estop = false;
+            PRINTF("Command ARM seq=%u: armed, emergency stop cleared\r\n",
+                   header.sequence);
             return true;
 
         case rf_protocol::CMD_MOVE: {
@@ -189,6 +226,12 @@ bool handle_wanderer_command(const uint8_t *payload, uint8_t length,
                 state->target_left_mm_s = command.velocity_left_mm_s;
                 state->target_right_mm_s =
                     command.velocity_right_mm_s;
+                PRINTF("Command MOVE seq=%u: left=%d right=%d mm/s\r\n",
+                       command.sequence, command.velocity_left_mm_s,
+                       command.velocity_right_mm_s);
+            } else {
+                PRINTF("Command MOVE seq=%u ignored: Wanderer is not armed\r\n",
+                       command.sequence);
             }
             return true;
         }
@@ -197,12 +240,26 @@ bool handle_wanderer_command(const uint8_t *payload, uint8_t length,
             if (length != sizeof(rf_protocol::CommandHeader)) {
                 return false;
             }
-            state->pending_version = true;
-            state->pending_version_sequence = header.sequence;
+            state->pending_reply = {
+                true,
+                rf_protocol::REPLY_VERSION,
+            };
+            PRINTF("Command GETVER seq=%u: version reply queued\r\n",
+                   header.sequence);
             return true;
 
-        case rf_protocol::CMD_SETPARAM:
-            return length == sizeof(rf_protocol::SetParameterCommand);
+        case rf_protocol::CMD_SETPARAM: {
+            if (length != sizeof(rf_protocol::SetParameterCommand)) {
+                return false;
+            }
+            rf_protocol::SetParameterCommand command{};
+            std::memcpy(&command, payload, sizeof(command));
+            PRINTF("Command SETPARAM seq=%u id=%u value=%ld: "
+                   "no parameter handler installed\r\n",
+                   command.sequence, command.parameter_id,
+                   static_cast<long>(command.value));
+            return true;
+        }
 
         default:
             return false;
@@ -217,6 +274,8 @@ void stop_wanderer(WandererState *state) {
 }
 
 void process_wanderer_radio(WandererState *state) {
+    // Drain every received command. The nRF24 hardware has already discarded
+    // packets that failed its CRC before they can appear in this FIFO.
     uint8_t pipe = 0;
     while (radio.available(&pipe)) {
         const uint8_t length = radio.getDynamicPayloadSize();
@@ -230,12 +289,16 @@ void process_wanderer_radio(WandererState *state) {
         uint8_t payload[rf_protocol::MAX_PAYLOAD_SIZE]{};
         radio.read(payload, length);
 
+        // Only a valid, recognized command refreshes the safety watchdog.
         if (pipe == RADIO_PIPE &&
             handle_wanderer_command(payload, length, state)) {
             state->last_valid_command = get_absolute_time();
         }
 
         if (!stage_next_ack_payload(state)) {
+            // The ACK payload uses the three-entry TX FIFO. A failed queue
+            // operation means stale entries filled it; discard them and put
+            // back one fresh reply.
             radio.flush_tx();
             stage_next_ack_payload(state);
         }
@@ -250,6 +313,8 @@ void process_wanderer_failsafe(WandererState *state) {
     }
 
     if (!state->estop) {
+        // This safety action happens entirely on the Wanderer. It does not
+        // depend on a message from the base and still works if the base dies.
         stop_wanderer(state);
 
         // Replace the staged payload so the first ACK after link recovery
@@ -260,6 +325,95 @@ void process_wanderer_failsafe(WandererState *state) {
     }
 }
 
+void update_telemetry_sequence(uint8_t sequence, BaseState *state) {
+    // Unsigned 8-bit subtraction handles normal wraparound automatically.
+    // Example: last=255, current=0 gives an advance of 1, not a gap.
+    if (state->telemetry_sequence_valid) {
+        const uint8_t advance =
+            static_cast<uint8_t>(sequence -
+                                 state->last_telemetry_sequence);
+        if (advance > 1) {
+            state->telemetry_gaps +=
+                static_cast<uint32_t>(advance - 1u);
+        }
+    } else {
+        state->telemetry_sequence_valid = true;
+    }
+
+    state->last_telemetry_sequence = sequence;
+}
+
+void print_telemetry_health(BaseState *state) {
+    // Report measured frames/second over the latest interval. The first gap
+    // number is new gaps in this interval; the second is total since boot.
+    const absolute_time_t now = get_absolute_time();
+    const int64_t elapsed_us =
+        absolute_time_diff_us(state->telemetry_report_started, now);
+    const uint32_t interval_frames =
+        state->telemetry_received -
+        state->telemetry_received_at_report;
+    const uint32_t interval_gaps =
+        state->telemetry_gaps - state->telemetry_gaps_at_report;
+
+    uint32_t rate_tenths = 0;
+    if (elapsed_us > 0) {
+        rate_tenths = static_cast<uint32_t>(
+            (static_cast<uint64_t>(interval_frames) * 10000000u) /
+            static_cast<uint64_t>(elapsed_us));
+    }
+
+    PRINTF("Telemetry OK: rate=%lu.%lu Hz total=%lu gaps=%lu/%lu\r\n",
+           static_cast<unsigned long>(rate_tenths / 10u),
+           static_cast<unsigned long>(rate_tenths % 10u),
+           static_cast<unsigned long>(state->telemetry_received),
+           static_cast<unsigned long>(interval_gaps),
+           static_cast<unsigned long>(state->telemetry_gaps));
+
+    state->telemetry_received_at_report =
+        state->telemetry_received;
+    state->telemetry_gaps_at_report = state->telemetry_gaps;
+    state->telemetry_report_started = now;
+    state->next_telemetry_report =
+        make_timeout_time_ms(TELEMETRY_REPORT_MS);
+}
+
+void report_wanderer_state(uint8_t flags, BaseState *state) {
+    // Normal state is not printed repeatedly. State transitions are more
+    // useful to a person watching the terminal than five-second repetitions.
+    const bool running =
+        (flags & rf_protocol::FLAG_RUNNING) != 0;
+    const bool estop =
+        (flags & rf_protocol::FLAG_ESTOP) != 0;
+
+    if (!state->telemetry_flags_valid) {
+        state->telemetry_flags_valid = true;
+        PRINTF("Wanderer state: running=%s estop=%s\r\n",
+               running ? "yes" : "no",
+               estop ? "active" : "clear");
+        return;
+    }
+
+    const bool was_running =
+        (state->last_telemetry_flags &
+         rf_protocol::FLAG_RUNNING) != 0;
+    const bool was_estop =
+        (state->last_telemetry_flags &
+         rf_protocol::FLAG_ESTOP) != 0;
+
+    if (estop != was_estop) {
+        if (estop) {
+            PRINTF("ALERT: Wanderer emergency stop active\r\n");
+        } else {
+            PRINTF("Wanderer emergency stop cleared\r\n");
+        }
+    }
+
+    if (running != was_running) {
+        PRINTF("Wanderer movement state: %s\r\n",
+               running ? "running" : "stopped");
+    }
+}
+
 void process_base_reply(const uint8_t *payload, uint8_t length,
                         BaseState *state) {
     if (length == sizeof(rf_protocol::TelemetryV1) &&
@@ -267,6 +421,9 @@ void process_base_reply(const uint8_t *payload, uint8_t length,
         rf_protocol::TelemetryV1 telemetry{};
         std::memcpy(&telemetry, payload, sizeof(telemetry));
         ++state->telemetry_received;
+        update_telemetry_sequence(telemetry.sequence, state);
+        report_wanderer_state(telemetry.flags, state);
+        state->last_telemetry_flags = telemetry.flags;
 
         if (state->arm_confirmation_pending &&
             (telemetry.flags & rf_protocol::FLAG_ESTOP) == 0) {
@@ -274,20 +431,19 @@ void process_base_reply(const uint8_t *payload, uint8_t length,
             PRINTF("ARM confirmed: FLAG_ESTOP cleared\r\n");
         }
 
-        if ((state->telemetry_received % 100u) == 0u) {
-            PRINTF("Telemetry seq=%u flags=0x%02X frames=%lu\r\n",
-                   telemetry.sequence, telemetry.flags,
-                   static_cast<unsigned long>(
-                       state->telemetry_received));
+        if (time_reached(state->next_telemetry_report)) {
+            print_telemetry_health(state);
         }
     }
 }
 
 void update_base_link(bool delivered, BaseState *state) {
+    // radio.write() returning false means no ACK arrived. It says the RF link
+    // failed, not necessarily that this base radio is broken.
     if (!delivered) {
         if (state->link_up) {
             state->link_up = false;
-            PRINTF("Base: link lost\r\n");
+            PRINTF("Base: link lost; Wanderer failsafe assumed active\r\n");
         }
         return;
     }
@@ -329,6 +485,8 @@ void poll_wanderer(BaseState *state) {
     state->next_poll = make_timeout_time_ms(POLL_PERIOD_MS);
 
     const rf_protocol::CommandHeader command{
+        // NOP has no vehicle action. Its purpose is to keep the watchdog
+        // alive and clock the next telemetry ACK payload back to the base.
         rf_protocol::CMD_NOP,
         state->command_sequence++,
     };
@@ -343,28 +501,26 @@ bool request_reply(uint8_t command_type, uint8_t expected_reply_type,
         return false;
     }
 
-    const uint8_t request_sequence = state->command_sequence++;
     const rf_protocol::CommandHeader request{
         command_type,
-        request_sequence,
+        state->command_sequence++,
     };
-    absolute_time_t next_request = get_absolute_time();
     const absolute_time_t deadline = make_timeout_time_ms(timeout_ms);
 
+    // Send the request once. radio.write() already uses the nRF24 hardware
+    // retry mechanism. After delivery, NOP polls retrieve the reply that the
+    // Wanderer stages for a later ACK payload.
+    if (!transmit_base_frame(&request, sizeof(request), state)) {
+        state->next_poll = make_timeout_time_ms(POLL_PERIOD_MS);
+        return false;
+    }
+
     while (!time_reached(deadline)) {
-        const bool send_request = time_reached(next_request);
         const rf_protocol::CommandHeader nop{
             rf_protocol::CMD_NOP,
             state->command_sequence++,
         };
-        const rf_protocol::CommandHeader *frame =
-            send_request ? &request : &nop;
-
-        if (send_request) {
-            next_request = make_timeout_time_ms(REQUEST_REARM_MS);
-        }
-
-        const bool delivered = radio.write(frame, sizeof(*frame));
+        const bool delivered = radio.write(&nop, sizeof(nop));
         update_base_link(delivered, state);
 
         if (delivered) {
@@ -380,8 +536,7 @@ bool request_reply(uint8_t command_type, uint8_t expected_reply_type,
                 radio.read(payload, length);
 
                 if (length == expected_reply_length &&
-                    payload[0] == expected_reply_type &&
-                    payload[1] == request_sequence) {
+                    payload[0] == expected_reply_type) {
                     std::memcpy(reply, payload, length);
                     state->next_poll =
                         make_timeout_time_ms(POLL_PERIOD_MS);
@@ -411,6 +566,9 @@ void print_base_help() {
 
 void send_simple_command(uint8_t command_type, const char *name,
                          BaseState *state) {
+    // Hardware ACK proves that the Wanderer radio received this command.
+    // Commands that need application-level data, such as GETVER, instead use
+    // request_reply() and wait for a matching typed ACK payload.
     const rf_protocol::CommandHeader command{
         command_type,
         state->command_sequence++,
@@ -423,6 +581,8 @@ void send_simple_command(uint8_t command_type, const char *name,
 }
 
 void process_base_command_line(char *line, BaseState *state) {
+    // This text CLI is temporary development tooling. Step 5 replaces it with
+    // the framed binary laptop protocol.
     if (std::strcmp(line, "help") == 0) {
         print_base_help();
     } else if (std::strcmp(line, "arm") == 0) {
@@ -447,13 +607,8 @@ void process_base_command_line(char *line, BaseState *state) {
                           rf_protocol::REPLY_VERSION,
                           sizeof(version), &version, sizeof(version),
                           REQUEST_TIMEOUT_MS, state)) {
-            PRINTF("GETVER version=%u.%u.%u protocol=%u "
-                   "git=%08lX build=%lu hardware=%u\r\n",
-                   version.firmware_major, version.firmware_minor,
-                   version.firmware_patch, version.protocol_version,
-                   static_cast<unsigned long>(version.git_hash),
-                   static_cast<unsigned long>(version.build_date),
-                   version.hardware_id);
+            PRINTF("GETVER version=%u.%u\r\n",
+                   version.firmware_major, version.firmware_minor);
         } else {
             PRINTF("GETVER timeout after %lu ms\r\n",
                    static_cast<unsigned long>(REQUEST_TIMEOUT_MS));
@@ -499,6 +654,8 @@ void process_base_command_line(char *line, BaseState *state) {
 }
 
 void poll_base_usb(BaseState *state) {
+    // USB CDC is a byte stream. Accumulate a line without blocking the 100 Hz
+    // RF polling loop.
     static char line[COMMAND_LINE_SIZE];
     static size_t length;
 
@@ -561,9 +718,14 @@ int main() {
     wanderer.last_valid_command = get_absolute_time();
 
     BaseState base{};
+    base.telemetry_report_started = get_absolute_time();
+    base.next_telemetry_report =
+        make_timeout_time_ms(TELEMETRY_REPORT_MS);
     base.next_poll = get_absolute_time();
 
     if (radio_ready && role == Role::Wanderer) {
+        // Without this preload, the first base poll would receive an empty
+        // ACK. Later ACK payloads are staged after each command is read.
         stage_next_ack_payload(&wanderer);
         radio.startListening();
     }

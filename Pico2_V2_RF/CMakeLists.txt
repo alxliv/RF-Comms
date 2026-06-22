@@ -15,26 +15,8 @@ pico_sdk_init()
 
 include(${CMAKE_CURRENT_LIST_DIR}/lib/RF24/CMakeLists.txt)
 
-execute_process(
-    COMMAND git rev-parse --short=8 HEAD
-    WORKING_DIRECTORY ${CMAKE_CURRENT_LIST_DIR}/..
-    OUTPUT_VARIABLE GIT_HASH
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-    ERROR_QUIET
-)
-if(NOT GIT_HASH MATCHES "^[0-9a-fA-F]{8}$")
-    set(GIT_HASH "00000000")
-endif()
-
-string(TIMESTAMP BUILD_DATE "%Y%m%d")
-
 add_executable(pico2_v2_rf
     src/main.cpp
-)
-
-target_compile_definitions(pico2_v2_rf PRIVATE
-    FW_GIT_HASH=0x${GIT_HASH}u
-    FW_BUILD_DATE=${BUILD_DATE}u
 )
 
 set_source_files_properties(

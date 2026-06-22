@@ -482,7 +482,7 @@ Command header       2 bytes: type, sequence
 MOVE command         6 bytes: type, sequence, left velocity, right velocity
 SETPARAM command     7 bytes: type, sequence, parameter ID, signed value
 Telemetry V1        25 bytes: <BBBHBhhhhiiHB
-Firmware version    15 bytes: <BBBBBBIIB
+Firmware version     3 bytes: type, major, minor
 ```
 
 All multi-byte fields are little-endian. The radio link relies on the nRF24
@@ -525,9 +525,35 @@ stop telemetry flag. Physical motor and sensor integration is not present, so
 the remaining telemetry values are currently zero.
 
 During this development step, USB CDC still carries human-readable diagnostic
-text. The base reports link transitions and prints one telemetry summary per
-100 received frames. Step 5 will replace this diagnostic stream with framed
-binary host messages.
+text. Every five seconds the base prints a link-health summary:
+
+```text
+Telemetry OK: rate=100.0 Hz total=2500 gaps=0/213
+```
+
+The rate is measured over the reporting interval. `gaps` is printed as
+`interval/total`: sequence values skipped during the latest reporting interval
+followed by the cumulative count since startup.
+
+Wanderer movement and emergency-stop states are printed once when telemetry
+starts and then only when they change. If the RF link itself is lost, the base
+cannot receive new telemetry and instead immediately reports:
+
+```text
+Base: link lost; Wanderer failsafe assumed active
+```
+
+After reconnection, telemetry confirms whether the Wanderer's local watchdog
+set the emergency-stop flag. State messages therefore look like:
+
+```text
+Wanderer state: running=no estop=clear
+Wanderer movement state: running
+ALERT: Wanderer emergency stop active
+Wanderer emergency stop cleared
+```
+
+Step 5 will replace this diagnostic stream with framed binary host messages.
 
 ### V2 base commands
 
@@ -554,14 +580,24 @@ ARM confirmed: FLAG_ESTOP cleared
 ```
 
 `getver` uses the generic typed request/reply matcher. The base sends
-`CMD_GETVER`, continues polling, forwards telemetry through its normal
-processing path, and accepts only a 15-byte `REPLY_VERSION` with the matching
-request sequence. It re-arms the request every 20 milliseconds and times out
-after 500 milliseconds. The returned fields include firmware version,
-protocol version, the build commit's short Git hash, build date, and hardware
-ID.
+`CMD_GETVER` once and relies on the nRF24 hardware retry mechanism for delivery.
+It then continues sending `NOP` polls, forwards telemetry through its normal
+processing path, and accepts a three-byte `REPLY_VERSION`. The request times
+out after 500 milliseconds. The version data is exactly two bytes: major
+followed by minor.
 
 `move L R` accepts signed 16-bit velocity targets in millimeters per second.
 The Wanderer records targets only while armed. Motor output remains
 unimplemented, so this command currently verifies transport and command
 decoding only.
+
+When the Wanderer is connected to USB CDC, it prints each actionable command
+and the resulting state change. Routine 100 Hz `NOP` polls are intentionally
+not printed. Example:
+
+```text
+Command ARM seq=42: armed, emergency stop cleared
+Command MOVE seq=43: left=250 right=250 mm/s
+Command GETVER seq=44: version reply queued
+Command STOP seq=45: disarmed, targets cleared
+```
