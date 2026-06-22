@@ -398,7 +398,7 @@ weaker or very infrequent interference.
 vehicle and will use nRF24 Enhanced ShockBurst ACK payloads for telemetry from
 the Wanderer to the base station.
 
-The current Step 1 scaffold:
+The current V2 firmware:
 
 - Builds for Raspberry Pi Pico 2 (`RP2350`, ARM).
 - Uses C++17 and Raspberry Pi Pico SDK 2.2.0.
@@ -416,6 +416,7 @@ GP17 = CSN
 GP16 = MISO
 GP18 = SCK
 GP19 = MOSI
+GP20 = role strap: high = base, low = Wanderer
 ```
 
 ### Building Pico2 V2 RF
@@ -445,9 +446,8 @@ The generated UF2 is:
 Pico2_V2_RF/build-release/pico2_v2_rf.uf2
 ```
 
-The current firmware is only an RF24/Pico 2 compatibility smoke test. The
-ACK-payload radio transport, request/reply matching, and binary USB host
-protocol are not implemented yet.
+The current firmware implements the V2 ACK-payload radio transport and typed
+request matching. The binary USB host protocol is not implemented yet.
 
 ### V2 wire protocol
 
@@ -488,3 +488,80 @@ Firmware version    15 bytes: <BBBBBBIIB
 All multi-byte fields are little-endian. The radio link relies on the nRF24
 two-byte hardware CRC and hardware retransmission; V2 does not add another CRC
 inside the radio payload.
+
+### V2 ACK-payload transport
+
+Flash the same UF2 onto both Pico 2 boards and set GP20 before reset:
+
+- Base: GP20 high.
+- Wanderer: GP20 low or unconnected; the internal pulldown selects this role.
+
+The base remains in primary-transmitter mode and sends a two-byte `NOP`
+command every 10 milliseconds. The Wanderer remains in primary-receiver mode.
+It preloads a telemetry payload before listening, and the nRF24 automatically
+attaches that payload to the next hardware ACK. After reading each command,
+the Wanderer stages the following telemetry or typed reply.
+
+Current radio settings:
+
+```text
+Address: V2RF1
+Channel: 76
+Data rate: 1 Mbps
+CRC: two-byte hardware CRC
+Auto-ack: enabled
+Hardware retries: 15
+Transmit power: minimum
+Dynamic payloads: enabled
+ACK payloads: enabled
+Base polling: 100 Hz
+```
+
+The Wanderer accepts `NOP`, `STOP`, `ARM`, `MOVE`, `GETVER`, and `SETPARAM`
+frames with their exact defined lengths. Unknown or malformed commands do not
+refresh the link watchdog. If no valid command is received for 200
+milliseconds, the Wanderer clears its movement targets and sets the emergency
+stop telemetry flag. Physical motor and sensor integration is not present, so
+the remaining telemetry values are currently zero.
+
+During this development step, USB CDC still carries human-readable diagnostic
+text. The base reports link transitions and prints one telemetry summary per
+100 received frames. Step 5 will replace this diagnostic stream with framed
+binary host messages.
+
+### V2 base commands
+
+The base currently accepts these text commands over USB CDC:
+
+```text
+help
+arm
+stop
+move L R
+getver
+```
+
+The CLI is available only on the base-role Pico. USB output follows the
+current CDC connection state, so closing and reopening the terminal does not
+permanently suppress command responses.
+
+`arm` sends `CMD_ARM`, then waits up to 500 milliseconds for telemetry with
+`FLAG_ESTOP` cleared. A successful exchange prints:
+
+```text
+ARM delivered; waiting for telemetry confirmation
+ARM confirmed: FLAG_ESTOP cleared
+```
+
+`getver` uses the generic typed request/reply matcher. The base sends
+`CMD_GETVER`, continues polling, forwards telemetry through its normal
+processing path, and accepts only a 15-byte `REPLY_VERSION` with the matching
+request sequence. It re-arms the request every 20 milliseconds and times out
+after 500 milliseconds. The returned fields include firmware version,
+protocol version, the build commit's short Git hash, build date, and hardware
+ID.
+
+`move L R` accepts signed 16-bit velocity targets in millimeters per second.
+The Wanderer records targets only while armed. Motor output remains
+unimplemented, so this command currently verifies transport and command
+decoding only.
