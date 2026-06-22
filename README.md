@@ -616,13 +616,16 @@ The CLI is available only on the base-role Pico. USB output follows the
 current CDC connection state, so closing and reopening the terminal does not
 permanently suppress command responses.
 
-`arm` sends `CMD_ARM`, then waits up to 500 milliseconds for telemetry with
-`FLAG_ESTOP` cleared. A successful exchange prints:
+`arm` sends `CMD_ARM` once and reports the nRF24 hardware acknowledgement,
+the same as `stop` and `move`:
 
 ```text
-ARM delivered; waiting for telemetry confirmation
-ARM confirmed: FLAG_ESTOP cleared
+ARM delivered
 ```
+
+Telemetry is a one-way status stream, not a reply channel, so neither `arm`
+nor any other command waits on it. A future `GETSTAT` command will cover
+querying whether the Wanderer is actually armed.
 
 `getver` uses the generic typed request/reply matcher. The base sends
 `CMD_GETVER` once and relies on the nRF24 hardware retry mechanism for delivery.

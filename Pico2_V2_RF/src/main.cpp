@@ -27,7 +27,6 @@ constexpr uint32_t LINK_TIMEOUT_MS = 200;
 constexpr uint32_t RADIO_HEALTH_PERIOD_MS = 1000;
 constexpr uint32_t TELEMETRY_REPORT_MS = 5000;
 constexpr uint32_t REQUEST_TIMEOUT_MS = 500;
-constexpr uint32_t ARM_CONFIRM_TIMEOUT_MS = 500;
 constexpr size_t COMMAND_LINE_SIZE = 64;
 constexpr uint8_t RADIO_ADDRESS[5] = {'V', '2', 'R', 'F', '1'};
 
@@ -61,18 +60,13 @@ struct BaseState {
     // from 255 back to 0.
     uint8_t command_sequence;
     bool link_up;
-    bool arm_confirmation_pending;
-    bool telemetry_sequence_valid;
-    bool telemetry_flags_valid;
     uint8_t last_telemetry_sequence;
     uint32_t telemetry_received;
     uint32_t telemetry_received_at_report;
     uint32_t telemetry_gaps;
     uint32_t telemetry_gaps_at_report;
     uint8_t last_telemetry_flags;
-    absolute_time_t arm_confirmation_deadline;
     absolute_time_t telemetry_report_started;
-    absolute_time_t next_telemetry_report;
     absolute_time_t next_poll;
 };
 
@@ -364,10 +358,14 @@ void process_wanderer_failsafe(WandererState *state) {
     }
 }
 
-void update_telemetry_sequence(uint8_t sequence, BaseState *state) {
+void update_telemetry_sequence(uint8_t sequence, bool first_telemetry,
+                               BaseState *state) {
     // Unsigned 8-bit subtraction handles normal wraparound automatically.
     // Example: last=255, current=0 gives an advance of 1, not a gap.
-    if (state->telemetry_sequence_valid) {
+    // The very first telemetry packet ever received has no real prior
+    // sequence to compare against (last_telemetry_sequence defaults to 0,
+    // which is not a meaningful baseline), so it only seeds the baseline.
+    if (!first_telemetry) {
         const uint8_t advance =
             static_cast<uint8_t>(sequence -
                                  state->last_telemetry_sequence);
@@ -375,8 +373,6 @@ void update_telemetry_sequence(uint8_t sequence, BaseState *state) {
             state->telemetry_gaps +=
                 static_cast<uint32_t>(advance - 1u);
         }
-    } else {
-        state->telemetry_sequence_valid = true;
     }
 
     state->last_telemetry_sequence = sequence;
@@ -412,11 +408,10 @@ void print_telemetry_health(BaseState *state) {
         state->telemetry_received;
     state->telemetry_gaps_at_report = state->telemetry_gaps;
     state->telemetry_report_started = now;
-    state->next_telemetry_report =
-        make_timeout_time_ms(TELEMETRY_REPORT_MS);
 }
 
-void report_wanderer_state(uint8_t flags, BaseState *state) {
+void report_wanderer_state(uint8_t flags, bool first_telemetry,
+                           BaseState *state) {
     // Normal state is not printed repeatedly. State transitions are more
     // useful to a person watching the terminal than five-second repetitions.
     const bool running =
@@ -424,8 +419,11 @@ void report_wanderer_state(uint8_t flags, BaseState *state) {
     const bool estop =
         (flags & rf_protocol::FLAG_ESTOP) != 0;
 
-    if (!state->telemetry_flags_valid) {
-        state->telemetry_flags_valid = true;
+    if (first_telemetry) {
+        // The very first telemetry packet ever received has no real prior
+        // flags to diff against (last_telemetry_flags defaults to 0, which
+        // is not a meaningful baseline), so report the starting state
+        // instead of a misleading transition.
         PRINTF("Wanderer state: running=%s estop=%s\r\n",
                running ? "yes" : "no",
                estop ? "active" : "clear");
@@ -459,19 +457,18 @@ void process_base_reply(const uint8_t *payload, uint8_t length,
         payload[0] == rf_protocol::REPLY_TELEMETRY_V1) {
         rf_protocol::TelemetryV1 telemetry{};
         std::memcpy(&telemetry, payload, sizeof(telemetry));
+        // telemetry_received is a monotonic, never-reset count, so checking
+        // it before incrementing tells us whether this is the first
+        // telemetry packet ever received (no two dedicated bools needed).
+        const bool first_telemetry = state->telemetry_received == 0;
         ++state->telemetry_received;
-        update_telemetry_sequence(telemetry.sequence, state);
-        report_wanderer_state(telemetry.flags, state);
+        update_telemetry_sequence(telemetry.sequence, first_telemetry, state);
+        report_wanderer_state(telemetry.flags, first_telemetry, state);
         state->last_telemetry_flags = telemetry.flags;
         send_host_frame(&telemetry, sizeof(telemetry));
 
-        if (state->arm_confirmation_pending &&
-            (telemetry.flags & rf_protocol::FLAG_ESTOP) == 0) {
-            state->arm_confirmation_pending = false;
-            PRINTF("ARM confirmed: FLAG_ESTOP cleared\r\n");
-        }
-
-        if (time_reached(state->next_telemetry_report)) {
+        if (time_reached(delayed_by_ms(state->telemetry_report_started,
+                                      TELEMETRY_REPORT_MS))) {
             print_telemetry_health(state);
         }
     }
@@ -605,22 +602,18 @@ bool request_reply(uint8_t command_type, uint8_t expected_reply_type,
 // the two interfaces cannot diverge in RF behavior.
 
 bool perform_arm(BaseState *state) {
+    // The nRF24 hardware ACK is the only delivery confirmation ARM gets, the
+    // same as STOP and MOVE. Telemetry is a one-way status stream, not a
+    // reply channel; a future GETSTAT command covers querying whether the
+    // Wanderer is actually armed.
     const rf_protocol::CommandHeader command{
         rf_protocol::CMD_ARM,
         state->command_sequence++,
     };
-    const bool delivered =
-        transmit_base_frame(&command, sizeof(command), state);
-    if (delivered) {
-        state->arm_confirmation_pending = true;
-        state->arm_confirmation_deadline =
-            make_timeout_time_ms(ARM_CONFIRM_TIMEOUT_MS);
-    }
-    return delivered;
+    return transmit_base_frame(&command, sizeof(command), state);
 }
 
 bool perform_stop(BaseState *state) {
-    state->arm_confirmation_pending = false;
     const rf_protocol::CommandHeader command{
         rf_protocol::CMD_STOP,
         state->command_sequence++,
@@ -733,7 +726,7 @@ void process_base_command_line(char *line, BaseState *state) {
         print_base_help();
     } else if (std::strcmp(line, "arm") == 0) {
         if (perform_arm(state)) {
-            PRINTF("ARM delivered; waiting for telemetry confirmation\r\n");
+            PRINTF("ARM delivered\r\n");
         } else {
             PRINTF("ARM failed: no acknowledgement\r\n");
         }
@@ -875,14 +868,6 @@ void poll_base_usb(BaseState *state) {
     }
 }
 
-void process_base_timeouts(BaseState *state) {
-    if (state->arm_confirmation_pending &&
-        time_reached(state->arm_confirmation_deadline)) {
-        state->arm_confirmation_pending = false;
-        PRINTF("ARM telemetry confirmation timeout\r\n");
-    }
-}
-
 }  // namespace
 
 int main() {
@@ -917,8 +902,6 @@ int main() {
 
     BaseState base{};
     base.telemetry_report_started = get_absolute_time();
-    base.next_telemetry_report =
-        make_timeout_time_ms(TELEMETRY_REPORT_MS);
     base.next_poll = get_absolute_time();
 
     if (radio_ready && role == Role::Wanderer) {
@@ -938,7 +921,6 @@ int main() {
             if (role == Role::Base) {
                 poll_base_usb(&base);
                 poll_wanderer(&base);
-                process_base_timeouts(&base);
             } else {
                 process_wanderer_radio(&wanderer);
                 process_wanderer_failsafe(&wanderer);
