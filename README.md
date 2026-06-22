@@ -553,11 +553,56 @@ ALERT: Wanderer emergency stop active
 Wanderer emergency stop cleared
 ```
 
-Step 5 will replace this diagnostic stream with framed binary host messages.
+### V2 binary host frame protocol
+
+The base's USB CDC link carries both the text CLI below and a binary frame
+protocol for host software, on the same byte stream. A frame always starts
+with a sync byte outside printable ASCII, so it cannot be confused with a
+typed text line:
+
+```text
+Byte 0        FRAME_SYNC = 0xAA
+Byte 1        Payload length N (0..32)
+Bytes 2..N+1  Payload: one of the structs in protocol.h
+Bytes N+2..N+3 CRC16-CCITT, little-endian, computed over [length byte + payload]
+```
+
+CRC16-CCITT uses the same algorithm as `Pico2_V1_RF/src/protocol.c`:
+initial value `0xFFFF`, polynomial `0x1021`, MSB-first. A frame with a bad CRC
+is silently dropped; the receiver resynchronizes on the next `0xAA` byte.
+
+The payload is always exactly one of the existing wire structs already used
+over RF — the host frame just carries them over USB instead of air. Host to
+base frame commands mirror the text CLI exactly: `CMD_ARM`, `CMD_STOP`,
+`CMD_MOVE`, `CMD_GETVER` (`CommandHeader`/`MoveCommand` from `protocol.h`).
+
+Base to host frames:
+
+- `TelemetryV1` — forwarded for every telemetry packet received from the
+  Wanderer, independent of the periodic human-readable health report.
+- `VersionReply` — sent in response to a `CMD_GETVER` frame.
+- `CommandResult` (new, reply type `0x04`) — sent in response to
+  `CMD_ARM`/`CMD_STOP`/`CMD_MOVE` frames: `{type, host_sequence, command_type,
+  success}`. `host_sequence` echoes the request's `sequence` field so the
+  host can match a result to the request it sent.
+- `RequestTimeoutNotice` (reply type `0x03`) — sent if a `CMD_GETVER` frame
+  gets no matching reply within its timeout: `{type, command_type}`.
+- `LinkLostNotice` (reply type `0x00`) — sent when the RF link to the
+  Wanderer is lost: `{type}`.
+
+A minimal Python client lives at `Pico2_V2_RF/host/wanderer_client.py`
+(`pip install pyserial`, then `python wanderer_client.py COM5`). It implements
+the same framing, offers `arm`/`stop`/`move L R`/`getver`/`quit` at a prompt,
+and prints decoded results, telemetry, and link-lost notices as they arrive on
+a background reader thread. It also prints the base's plain text CLI/
+diagnostic lines for visibility, since both interfaces share one USB CDC
+link.
 
 ### V2 base commands
 
-The base currently accepts these text commands over USB CDC:
+The base currently accepts these text commands over USB CDC. This CLI remains
+available for manual debugging over a serial terminal, alongside the binary
+host frame protocol described above:
 
 ```text
 help

@@ -90,6 +90,45 @@ SPI radio_spi;
 
 namespace {
 
+// Matches Pico2_V1_RF/src/protocol.c crc16_ccitt: init 0xFFFF, poly 0x1021,
+// MSB-first. Used to checksum binary host frames on the base's USB CDC link.
+uint16_t crc16_ccitt(const uint8_t *data, std::size_t length) {
+    uint16_t crc = 0xFFFF;
+    for (std::size_t index = 0; index < length; ++index) {
+        crc ^= static_cast<uint16_t>(data[index]) << 8;
+        for (uint8_t bit = 0; bit < 8; ++bit) {
+            crc = (crc & 0x8000u) != 0
+                      ? static_cast<uint16_t>((crc << 1) ^ 0x1021u)
+                      : static_cast<uint16_t>(crc << 1);
+        }
+    }
+    return crc;
+}
+
+// Writes [FRAME_SYNC][length][payload][crc_lo][crc_hi] to the base's USB CDC
+// link. The CRC covers the length byte and payload, matching the receive
+// side in poll_base_usb(). This is the binary counterpart to the text CLI,
+// intended for a host program rather than a human terminal.
+void send_host_frame(const void *payload, uint8_t length) {
+    if (!stdio_usb_connected() ||
+        length > rf_protocol::MAX_PAYLOAD_SIZE) {
+        return;
+    }
+
+    uint8_t frame[2 + rf_protocol::MAX_PAYLOAD_SIZE + 2];
+    frame[0] = rf_protocol::FRAME_SYNC;
+    frame[1] = length;
+    std::memcpy(frame + 2, payload, length);
+
+    const uint16_t crc =
+        crc16_ccitt(frame + 1, static_cast<std::size_t>(length) + 1);
+    frame[2 + length] = static_cast<uint8_t>(crc & 0xFFu);
+    frame[3 + length] = static_cast<uint8_t>(crc >> 8);
+
+    std::fwrite(frame, 1, static_cast<std::size_t>(length) + 4, stdout);
+    std::fflush(stdout);
+}
+
 Role read_role() {
     // The pulldown makes an unconnected role pin safely select Wanderer.
     gpio_init(PIN_ROLE);
@@ -424,6 +463,7 @@ void process_base_reply(const uint8_t *payload, uint8_t length,
         update_telemetry_sequence(telemetry.sequence, state);
         report_wanderer_state(telemetry.flags, state);
         state->last_telemetry_flags = telemetry.flags;
+        send_host_frame(&telemetry, sizeof(telemetry));
 
         if (state->arm_confirmation_pending &&
             (telemetry.flags & rf_protocol::FLAG_ESTOP) == 0) {
@@ -444,6 +484,10 @@ void update_base_link(bool delivered, BaseState *state) {
         if (state->link_up) {
             state->link_up = false;
             PRINTF("Base: link lost; Wanderer failsafe assumed active\r\n");
+            const rf_protocol::LinkLostNotice notice{
+                rf_protocol::REPLY_LINK_LOST,
+            };
+            send_host_frame(&notice, sizeof(notice));
         }
         return;
     }
@@ -555,6 +599,51 @@ bool request_reply(uint8_t command_type, uint8_t expected_reply_type,
     return false;
 }
 
+// The perform_*() helpers below hold the only code paths that build and
+// transmit each command. Both the text CLI (process_base_command_line) and
+// the binary host frame dispatcher (process_base_command_frame) call them, so
+// the two interfaces cannot diverge in RF behavior.
+
+bool perform_arm(BaseState *state) {
+    const rf_protocol::CommandHeader command{
+        rf_protocol::CMD_ARM,
+        state->command_sequence++,
+    };
+    const bool delivered =
+        transmit_base_frame(&command, sizeof(command), state);
+    if (delivered) {
+        state->arm_confirmation_pending = true;
+        state->arm_confirmation_deadline =
+            make_timeout_time_ms(ARM_CONFIRM_TIMEOUT_MS);
+    }
+    return delivered;
+}
+
+bool perform_stop(BaseState *state) {
+    state->arm_confirmation_pending = false;
+    const rf_protocol::CommandHeader command{
+        rf_protocol::CMD_STOP,
+        state->command_sequence++,
+    };
+    return transmit_base_frame(&command, sizeof(command), state);
+}
+
+bool perform_move(int16_t left_mm_s, int16_t right_mm_s, BaseState *state) {
+    const rf_protocol::MoveCommand command{
+        rf_protocol::CMD_MOVE,
+        state->command_sequence++,
+        left_mm_s,
+        right_mm_s,
+    };
+    return transmit_base_frame(&command, sizeof(command), state);
+}
+
+bool perform_getver(rf_protocol::VersionReply *version, BaseState *state) {
+    return request_reply(rf_protocol::CMD_GETVER, rf_protocol::REPLY_VERSION,
+                         sizeof(*version), version, sizeof(*version),
+                         REQUEST_TIMEOUT_MS, state);
+}
+
 void print_base_help() {
     PRINTF("Commands:\r\n");
     PRINTF("  help          Show commands\r\n");
@@ -564,49 +653,99 @@ void print_base_help() {
     PRINTF("  getver        Request Wanderer firmware version\r\n");
 }
 
-void send_simple_command(uint8_t command_type, const char *name,
-                         BaseState *state) {
-    // Hardware ACK proves that the Wanderer radio received this command.
-    // Commands that need application-level data, such as GETVER, instead use
-    // request_reply() and wait for a matching typed ACK payload.
-    const rf_protocol::CommandHeader command{
-        command_type,
-        state->command_sequence++,
-    };
-    if (transmit_base_frame(&command, sizeof(command), state)) {
-        PRINTF("%s delivered\r\n", name);
-    } else {
-        PRINTF("%s failed: no acknowledgement\r\n", name);
+void process_base_command_frame(const uint8_t *payload, uint8_t length,
+                                BaseState *state) {
+    // The binary host frame protocol carries the same command structs used
+    // over RF, just delivered over USB CDC instead of air. It mirrors
+    // exactly the text CLI's command set: ARM, STOP, MOVE, GETVER.
+    if (length < sizeof(rf_protocol::CommandHeader)) {
+        return;
+    }
+
+    rf_protocol::CommandHeader header{};
+    std::memcpy(&header, payload, sizeof(header));
+
+    switch (header.type) {
+        case rf_protocol::CMD_ARM:
+        case rf_protocol::CMD_STOP: {
+            if (length != sizeof(header)) {
+                return;
+            }
+            const bool delivered = header.type == rf_protocol::CMD_ARM
+                                       ? perform_arm(state)
+                                       : perform_stop(state);
+            const rf_protocol::CommandResult result{
+                rf_protocol::REPLY_COMMAND_RESULT,
+                header.sequence,
+                header.type,
+                delivered ? static_cast<uint8_t>(1) : static_cast<uint8_t>(0),
+            };
+            send_host_frame(&result, sizeof(result));
+            return;
+        }
+
+        case rf_protocol::CMD_MOVE: {
+            if (length != sizeof(rf_protocol::MoveCommand)) {
+                return;
+            }
+            rf_protocol::MoveCommand command{};
+            std::memcpy(&command, payload, sizeof(command));
+            const bool delivered = perform_move(command.velocity_left_mm_s,
+                                                command.velocity_right_mm_s,
+                                                state);
+            const rf_protocol::CommandResult result{
+                rf_protocol::REPLY_COMMAND_RESULT,
+                command.sequence,
+                rf_protocol::CMD_MOVE,
+                delivered ? static_cast<uint8_t>(1) : static_cast<uint8_t>(0),
+            };
+            send_host_frame(&result, sizeof(result));
+            return;
+        }
+
+        case rf_protocol::CMD_GETVER: {
+            if (length != sizeof(header)) {
+                return;
+            }
+            rf_protocol::VersionReply version{};
+            if (perform_getver(&version, state)) {
+                send_host_frame(&version, sizeof(version));
+            } else {
+                const rf_protocol::RequestTimeoutNotice notice{
+                    rf_protocol::REPLY_REQUEST_TIMEOUT,
+                    rf_protocol::CMD_GETVER,
+                };
+                send_host_frame(&notice, sizeof(notice));
+            }
+            return;
+        }
+
+        default:
+            return;
     }
 }
 
 void process_base_command_line(char *line, BaseState *state) {
-    // This text CLI is temporary development tooling. Step 5 replaces it with
-    // the framed binary laptop protocol.
+    // This text CLI remains for manual debugging over a serial terminal. The
+    // binary host frame protocol (process_base_command_frame) carries the
+    // same command set for host software and runs on the same USB CDC link.
     if (std::strcmp(line, "help") == 0) {
         print_base_help();
     } else if (std::strcmp(line, "arm") == 0) {
-        const rf_protocol::CommandHeader command{
-            rf_protocol::CMD_ARM,
-            state->command_sequence++,
-        };
-        if (transmit_base_frame(&command, sizeof(command), state)) {
-            state->arm_confirmation_pending = true;
-            state->arm_confirmation_deadline =
-                make_timeout_time_ms(ARM_CONFIRM_TIMEOUT_MS);
+        if (perform_arm(state)) {
             PRINTF("ARM delivered; waiting for telemetry confirmation\r\n");
         } else {
             PRINTF("ARM failed: no acknowledgement\r\n");
         }
     } else if (std::strcmp(line, "stop") == 0) {
-        state->arm_confirmation_pending = false;
-        send_simple_command(rf_protocol::CMD_STOP, "STOP", state);
+        if (perform_stop(state)) {
+            PRINTF("STOP delivered\r\n");
+        } else {
+            PRINTF("STOP failed: no acknowledgement\r\n");
+        }
     } else if (std::strcmp(line, "getver") == 0) {
         rf_protocol::VersionReply version{};
-        if (request_reply(rf_protocol::CMD_GETVER,
-                          rf_protocol::REPLY_VERSION,
-                          sizeof(version), &version, sizeof(version),
-                          REQUEST_TIMEOUT_MS, state)) {
+        if (perform_getver(&version, state)) {
             PRINTF("GETVER version=%u.%u\r\n",
                    version.firmware_major, version.firmware_minor);
         } else {
@@ -636,13 +775,8 @@ void process_base_command_line(char *line, BaseState *state) {
             return;
         }
 
-        const rf_protocol::MoveCommand command{
-            rf_protocol::CMD_MOVE,
-            state->command_sequence++,
-            static_cast<int16_t>(left),
-            static_cast<int16_t>(right),
-        };
-        if (transmit_base_frame(&command, sizeof(command), state)) {
+        if (perform_move(static_cast<int16_t>(left),
+                         static_cast<int16_t>(right), state)) {
             PRINTF("MOVE delivered left=%ld right=%ld\r\n",
                    left, right);
         } else {
@@ -653,27 +787,91 @@ void process_base_command_line(char *line, BaseState *state) {
     }
 }
 
+enum class HostInputState : uint8_t {
+    Text,
+    FrameLength,
+    FramePayload,
+    FrameCrc,
+};
+
 void poll_base_usb(BaseState *state) {
-    // USB CDC is a byte stream. Accumulate a line without blocking the 100 Hz
-    // RF polling loop.
+    // USB CDC is a byte stream shared by the typed text CLI and binary host
+    // frames. A frame always starts with FRAME_SYNC, a byte outside
+    // printable ASCII that a human never types, so the two coexist on one
+    // stream without a separate channel.
     static char line[COMMAND_LINE_SIZE];
-    static size_t length;
+    static size_t line_length;
+    static HostInputState input_state = HostInputState::Text;
+    static uint8_t frame_payload[rf_protocol::MAX_PAYLOAD_SIZE];
+    static uint8_t frame_length;
+    static uint8_t frame_received;
+    static uint8_t frame_crc[2];
 
     int input = 0;
     while ((input = getchar_timeout_us(0)) != PICO_ERROR_TIMEOUT) {
-        if (input == '\r' || input == '\n') {
-            if (length != 0) {
-                line[length] = '\0';
-                process_base_command_line(line, state);
-                length = 0;
+        const uint8_t byte = static_cast<uint8_t>(input);
+
+        if (input_state == HostInputState::Text) {
+            if (byte == rf_protocol::FRAME_SYNC) {
+                input_state = HostInputState::FrameLength;
+            } else if (input == '\r' || input == '\n') {
+                if (line_length != 0) {
+                    line[line_length] = '\0';
+                    process_base_command_line(line, state);
+                    line_length = 0;
+                }
+            } else if (input == '\b' || input == 0x7F) {
+                if (line_length != 0) {
+                    --line_length;
+                }
+            } else if (line_length + 1 < sizeof(line)) {
+                line[line_length++] = static_cast<char>(input);
             }
-        } else if (input == '\b' || input == 0x7F) {
-            if (length != 0) {
-                --length;
-            }
-        } else if (length + 1 < sizeof(line)) {
-            line[length++] = static_cast<char>(input);
+            continue;
         }
+
+        if (input_state == HostInputState::FrameLength) {
+            if (byte > rf_protocol::MAX_PAYLOAD_SIZE) {
+                // Implausible length; resync on the next FRAME_SYNC byte.
+                input_state = HostInputState::Text;
+                continue;
+            }
+            frame_length = byte;
+            frame_received = 0;
+            input_state = frame_length == 0 ? HostInputState::FrameCrc
+                                            : HostInputState::FramePayload;
+            continue;
+        }
+
+        if (input_state == HostInputState::FramePayload) {
+            frame_payload[frame_received++] = byte;
+            if (frame_received == frame_length) {
+                input_state = HostInputState::FrameCrc;
+                frame_received = 0;
+            }
+            continue;
+        }
+
+        // HostInputState::FrameCrc
+        frame_crc[frame_received++] = byte;
+        if (frame_received < 2) {
+            continue;
+        }
+
+        input_state = HostInputState::Text;
+        uint8_t check_buffer[1 + rf_protocol::MAX_PAYLOAD_SIZE];
+        check_buffer[0] = frame_length;
+        std::memcpy(check_buffer + 1, frame_payload, frame_length);
+        const uint16_t expected =
+            static_cast<uint16_t>(frame_crc[0]) |
+            (static_cast<uint16_t>(frame_crc[1]) << 8);
+        if (expected ==
+            crc16_ccitt(check_buffer,
+                        static_cast<std::size_t>(frame_length) + 1)) {
+            process_base_command_frame(frame_payload, frame_length, state);
+        }
+        // A CRC mismatch silently drops the frame; the next FRAME_SYNC byte
+        // resynchronizes the receiver.
     }
 }
 
