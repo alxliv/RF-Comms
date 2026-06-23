@@ -446,8 +446,10 @@ The generated UF2 is:
 Pico2_V2_RF/build-release/pico2_v2_rf.uf2
 ```
 
-The current firmware implements the V2 ACK-payload radio transport and typed
-request matching. The binary USB host protocol is not implemented yet.
+The current firmware implements the V2 ACK-payload radio transport with a
+fully asynchronous downlink: the base sends commands fire-and-forget and a
+single dispatcher routes every returned frame by type (telemetry or reply).
+The binary USB host protocol forwards that same stream to a laptop client.
 
 ### V2 wire protocol
 
@@ -455,7 +457,11 @@ request matching. The binary USB host protocol is not implemented yet.
 by the base, Wanderer, and future laptop software. Every payload fits within
 the nRF24 maximum of 32 bytes. Compile-time assertions verify the exact layout.
 
-Command identifiers:
+The link is fully asynchronous. The base never blocks waiting on a reply:
+commands set goals (`MOVE`/`STOP`/`ARM`) or ask a question (`GETVER`/
+`GETSTAT`), and every answer comes back later on a single downlink stream.
+
+Command identifiers (base -> Wanderer):
 
 ```text
 0x00  NOP
@@ -463,16 +469,17 @@ Command identifiers:
 0x11  ARM
 0x12  MOVE
 0x20  GETVER
-0x30  SETPARAM
+0x21  GETSTAT
 ```
 
-Reply identifiers:
+Reply/frame identifiers (Wanderer -> base). Every ACK payload is one of these,
+identified by its leading type byte:
 
 ```text
-0x00  Link lost
-0x01  Telemetry V1
+0x00  Link lost (synthesized locally by the base, never sent by the Wanderer)
+0x01  Telemetry
 0x02  Firmware version
-0x03  Request timeout
+0x03  Status
 ```
 
 Payload layouts:
@@ -480,9 +487,9 @@ Payload layouts:
 ```text
 Command header       2 bytes: type, sequence
 MOVE command         6 bytes: type, sequence, left velocity, right velocity
-SETPARAM command     7 bytes: type, sequence, parameter ID, signed value
-Telemetry V1        25 bytes: <BBBHBhhhhiiHB
+Telemetry            3 bytes: type, sequence, flags
 Firmware version     3 bytes: type, major, minor
+Status               6 bytes: type, flags, left target, right target
 ```
 
 All multi-byte fields are little-endian. The radio link relies on the nRF24
@@ -517,12 +524,17 @@ ACK payloads: enabled
 Base polling: 100 Hz
 ```
 
-The Wanderer accepts `NOP`, `STOP`, `ARM`, `MOVE`, `GETVER`, and `SETPARAM`
-frames with their exact defined lengths. Unknown or malformed commands do not
-refresh the link watchdog. If no valid command is received for 200
-milliseconds, the Wanderer clears its movement targets and sets the emergency
-stop telemetry flag. Physical motor and sensor integration is not present, so
-the remaining telemetry values are currently zero.
+The Wanderer accepts `NOP`, `STOP`, `ARM`, `MOVE`, `GETVER`, and `GETSTAT`
+frames with their exact defined lengths. Unknown or malformed commands are
+ignored. The Wanderer is semi-autonomous, so losing the base link does not
+force it to stop; it simply keeps its current targets until a new command
+arrives. Physical motor and sensor integration is not present yet, so
+telemetry currently carries only the sequence and state flags; real sensor
+fields are added when that hardware exists.
+
+`GETVER` and `GETSTAT` are answered asynchronously: the Wanderer queues the
+reply onto its downlink stream, and it rides the next available ACK ahead of
+routine telemetry. The base does not block waiting for it.
 
 During this development step, USB CDC still carries human-readable diagnostic
 text. Every five seconds the base prints a link-health summary:
@@ -535,22 +547,15 @@ The rate is measured over the reporting interval. `gaps` is printed as
 `interval/total`: sequence values skipped during the latest reporting interval
 followed by the cumulative count since startup.
 
-Wanderer movement and emergency-stop states are printed once when telemetry
-starts and then only when they change. If the RF link itself is lost, the base
-cannot receive new telemetry and instead immediately reports:
+The Wanderer's movement state is printed once when telemetry starts and then
+only when it changes. The base also reports link transitions from the presence
+or absence of the nRF24 hardware ACK:
 
 ```text
-Base: link lost; Wanderer failsafe assumed active
-```
-
-After reconnection, telemetry confirms whether the Wanderer's local watchdog
-set the emergency-stop flag. State messages therefore look like:
-
-```text
-Wanderer state: running=no estop=clear
+Wanderer state: running=no
+Base: link lost
+Base: link established
 Wanderer movement state: running
-ALERT: Wanderer emergency stop active
-Wanderer emergency stop cleared
 ```
 
 ### V2 binary host frame protocol
@@ -574,29 +579,21 @@ is silently dropped; the receiver resynchronizes on the next `0xAA` byte.
 The payload is always exactly one of the existing wire structs already used
 over RF — the host frame just carries them over USB instead of air. Host to
 base frame commands mirror the text CLI exactly: `CMD_ARM`, `CMD_STOP`,
-`CMD_MOVE`, `CMD_GETVER` (`CommandHeader`/`MoveCommand` from `protocol.h`).
+`CMD_MOVE`, `CMD_GETVER`, `CMD_GETSTAT` (`CommandHeader`/`MoveCommand` from
+`protocol.h`). Like the text CLI, all of them are fire-and-forget; the host
+sends and watches the forwarded downlink stream for the effect.
 
-Base to host frames:
+Base to host frames — the base forwards every frame it receives from the
+Wanderer verbatim, so the host sees the same asynchronous stream the base
+does:
 
-- `TelemetryV1` — forwarded for every telemetry packet received from the
-  Wanderer, independent of the periodic human-readable health report.
-- `VersionReply` — sent in response to a `CMD_GETVER` frame.
-- `CommandResult` (new, reply type `0x04`) — sent in response to
-  `CMD_ARM`/`CMD_STOP`/`CMD_MOVE` frames: `{type, host_sequence, command_type,
-  success}`. `host_sequence` echoes the request's `sequence` field so the
-  host can match a result to the request it sent.
-- `RequestTimeoutNotice` (reply type `0x03`) — sent if a `CMD_GETVER` frame
-  gets no matching reply within its timeout: `{type, command_type}`.
-- `LinkLostNotice` (reply type `0x00`) — sent when the RF link to the
-  Wanderer is lost: `{type}`.
-
-A minimal Python client lives at `Pico2_V2_RF/host/wanderer_client.py`
-(`pip install pyserial`, then `python wanderer_client.py COM5`). It implements
-the same framing, offers `arm`/`stop`/`move L R`/`getver`/`quit` at a prompt,
-and prints decoded results, telemetry, and link-lost notices as they arrive on
-a background reader thread. It also prints the base's plain text CLI/
-diagnostic lines for visibility, since both interfaces share one USB CDC
-link.
+- `Telemetry` — forwarded for every telemetry packet received, independent
+  of the periodic human-readable health report.
+- `VersionReply` — forwarded when a `GETVER` answer arrives.
+- `StatReply` (reply type `0x03`) — forwarded when a `GETSTAT` answer arrives:
+  `{type, flags, target_left_mm_s, target_right_mm_s}`.
+- `LinkLostNotice` (reply type `0x00`) — synthesized by the base when the RF
+  link to the Wanderer is lost: `{type}`.
 
 ### V2 base commands
 
@@ -610,6 +607,7 @@ arm
 stop
 move L R
 getver
+getstat
 ```
 
 The CLI is available only on the base-role Pico. USB output follows the
@@ -624,15 +622,23 @@ ARM delivered
 ```
 
 Telemetry is a one-way status stream, not a reply channel, so neither `arm`
-nor any other command waits on it. A future `GETSTAT` command will cover
-querying whether the Wanderer is actually armed.
+nor any other command waits on it.
 
-`getver` uses the generic typed request/reply matcher. The base sends
-`CMD_GETVER` once and relies on the nRF24 hardware retry mechanism for delivery.
-It then continues sending `NOP` polls, forwards telemetry through its normal
-processing path, and accepts a three-byte `REPLY_VERSION`. The request times
-out after 500 milliseconds. The version data is exactly two bytes: major
-followed by minor.
+`getver` and `getstat` are fully asynchronous. The base sends the query once,
+relies on the nRF24 hardware retry mechanism for delivery, and returns
+immediately:
+
+```text
+GETVER sent; version will follow
+```
+
+The Wanderer queues the answer onto its downlink stream and it rides the next
+ACK. When it arrives, the base's single downlink dispatcher prints it:
+
+```text
+Wanderer version=0.3
+Wanderer stat: armed=yes running=no target=0/0 mm/s
+```
 
 `move L R` accepts signed 16-bit velocity targets in millimeters per second.
 The Wanderer records targets only while armed. Motor output remains
@@ -644,7 +650,7 @@ and the resulting state change. Routine 100 Hz `NOP` polls are intentionally
 not printed. Example:
 
 ```text
-Command ARM seq=42: armed, emergency stop cleared
+Command ARM seq=42: armed
 Command MOVE seq=43: left=250 right=250 mm/s
 Command GETVER seq=44: version reply queued
 Command STOP seq=45: disarmed, targets cleared
