@@ -38,21 +38,15 @@ enum class Role : uint8_t {
     Base,
 };
 
-struct PendingReply {
-    bool active;
-    uint8_t type;
-};
-
 struct WandererState {
     // These are currently command/telemetry state only. Real motor-control
     // outputs and sensor readings will be connected later.
     bool armed;
     bool estop;
-    PendingReply pending_reply;
     uint8_t telemetry_sequence;
     int16_t target_left_mm_s;
     int16_t target_right_mm_s;
-    absolute_time_t last_valid_command;
+    absolute_time_t last_command_ts;
 };
 
 struct BaseState {
@@ -72,6 +66,15 @@ struct BaseState {
 
 RF24 radio(PIN_RF_CE, PIN_RF_CSN);
 SPI radio_spi;
+
+// What the Wanderer should stage as its next ACK payload instead of routine
+// telemetry. This is radio-layer staging state, not vehicle state, so it
+// lives here alongside radio/radio_spi rather than inside WandererState.
+struct PendingReply {
+    bool active;
+    uint8_t type;
+};
+PendingReply pending_reply;
 
 }  // namespace
 
@@ -192,10 +195,10 @@ bool stage_next_ack_payload(WandererState *state) {
     // Important: the ACK for the command currently being read has already
     // gone over the air. Therefore the payload staged here is always for the
     // following base poll. This one-poll delay is normal.
-    if (state->pending_reply.active) {
-        state->pending_reply.active = false;
+    if (pending_reply.active) {
+        pending_reply.active = false;
 
-        switch (state->pending_reply.type) {
+        switch (pending_reply.type) {
             case rf_protocol::REPLY_VERSION: {
                 const rf_protocol::VersionReply reply =
                     build_version_reply();
@@ -273,7 +276,7 @@ bool handle_wanderer_command(const uint8_t *payload, uint8_t length,
             if (length != sizeof(rf_protocol::CommandHeader)) {
                 return false;
             }
-            state->pending_reply = {
+            pending_reply = {
                 true,
                 rf_protocol::REPLY_VERSION,
             };
@@ -312,8 +315,11 @@ void process_wanderer_radio(WandererState *state) {
     uint8_t pipe = 0;
     while (radio.available(&pipe)) {
         const uint8_t length = radio.getDynamicPayloadSize();
-        if (length == 0 || length > rf_protocol::MAX_PAYLOAD_SIZE) {
-            radio.flush_rx();
+        if (length == 0) {
+            // getDynamicPayloadSize() already flushed RX itself: a 0 here
+            // means it detected a corrupted R_RX_PL_WID read (a known nRF24
+            // SPI erratum) and recovered. RX is already clean; only the
+            // ACK-payload TX FIFO is still our responsibility.
             radio.flush_tx();
             stage_next_ack_payload(state);
             return;
@@ -325,7 +331,7 @@ void process_wanderer_radio(WandererState *state) {
         // Only a valid, recognized command refreshes the safety watchdog.
         if (pipe == RADIO_PIPE &&
             handle_wanderer_command(payload, length, state)) {
-            state->last_valid_command = get_absolute_time();
+            state->last_command_ts = get_absolute_time();
         }
 
         if (!stage_next_ack_payload(state)) {
@@ -339,7 +345,7 @@ void process_wanderer_radio(WandererState *state) {
 }
 
 void process_wanderer_failsafe(WandererState *state) {
-    if (absolute_time_diff_us(state->last_valid_command,
+    if (absolute_time_diff_us(state->last_command_ts,
                               get_absolute_time()) <=
         static_cast<int64_t>(LINK_TIMEOUT_MS) * 1000) {
         return;
@@ -898,7 +904,7 @@ int main() {
     gpio_put(PICO_DEFAULT_LED_PIN, false);
 
     WandererState wanderer{};
-    wanderer.last_valid_command = get_absolute_time();
+    wanderer.last_command_ts = get_absolute_time();
 
     BaseState base{};
     base.telemetry_report_started = get_absolute_time();
