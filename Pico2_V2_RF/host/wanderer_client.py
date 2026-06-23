@@ -5,11 +5,13 @@ Requires: pip install pyserial
 Usage:
     python wanderer_client.py COM5
 
-Commands at the prompt: arm, stop, move L R, getver, quit
-Telemetry, link-lost notices, and command results from the base are printed
-as they arrive on a background reader thread. Plain text lines from the
-base's text CLI/diagnostics (still active on the same USB CDC link) are
-printed as-is for visibility.
+Commands at the prompt: arm, stop, move L R, getver, getstat, quit
+Telemetry, version/status replies, and link-lost notices from the base are
+printed as they arrive on a background reader thread. Query answers
+(getver/getstat) come back asynchronously on the downlink stream, not as a
+synchronous reply to the command. Plain text lines from the base's text
+CLI/diagnostics (still active on the same USB CDC link) are printed as-is
+for visibility.
 
 Wire format (must match Pico2_V2_RF/src/main.cpp and protocol.h):
     Byte 0        FRAME_SYNC = 0xAA
@@ -36,20 +38,22 @@ CMD_STOP = 0x10
 CMD_ARM = 0x11
 CMD_MOVE = 0x12
 CMD_GETVER = 0x20
-CMD_SETPARAM = 0x30
+CMD_GETSTAT = 0x21
 
 REPLY_LINK_LOST = 0x00
-REPLY_TELEMETRY_V1 = 0x01
+REPLY_TELEMETRY = 0x01
 REPLY_VERSION = 0x02
-REPLY_REQUEST_TIMEOUT = 0x03
-REPLY_COMMAND_RESULT = 0x04
+REPLY_STAT = 0x03
+
+# Telemetry/stat flag bits (rf_protocol::TelemetryFlag).
+WAND_MOVING = 1 << 0
+WAND_ARMED = 1 << 1
 
 COMMAND_HEADER = struct.Struct("<BB")
 MOVE_COMMAND = struct.Struct("<BBhh")
-TELEMETRY_V1 = struct.Struct("<BBBHBhhhhiiHB")
+TELEMETRY = struct.Struct("<BBB")
 VERSION_REPLY = struct.Struct("<BBB")
-COMMAND_RESULT = struct.Struct("<BBBB")
-REQUEST_TIMEOUT_NOTICE = struct.Struct("<BB")
+STAT_REPLY = struct.Struct("<BBhh")
 LINK_LOST_NOTICE = struct.Struct("<B")
 
 COMMAND_NAMES = {
@@ -58,8 +62,13 @@ COMMAND_NAMES = {
     CMD_ARM: "ARM",
     CMD_MOVE: "MOVE",
     CMD_GETVER: "GETVER",
-    CMD_SETPARAM: "SETPARAM",
+    CMD_GETSTAT: "GETSTAT",
 }
+
+
+def describe_flags(flags: int) -> str:
+    return (f"{'armed' if flags & WAND_ARMED else 'disarmed'},"
+            f"{'moving' if flags & WAND_MOVING else 'stopped'}")
 
 
 def crc16_ccitt(data: bytes) -> int:
@@ -87,31 +96,18 @@ def decode_payload(payload: bytes) -> str:
         return "<empty frame>"
 
     reply_type = payload[0]
-    if reply_type == REPLY_TELEMETRY_V1 and len(payload) == TELEMETRY_V1.size:
-        (_, sequence, flags, battery_mv, battery_percent, duty_left,
-         duty_right, velocity_left, velocity_right, encoder_left,
-         encoder_right, current_ma, cpu_load) = TELEMETRY_V1.unpack(payload)
-        return (f"TELEMETRY seq={sequence} flags=0x{flags:02x} "
-                f"battery={battery_mv}mV/{battery_percent}% "
-                f"duty=({duty_left},{duty_right}) "
-                f"velocity=({velocity_left},{velocity_right})mm/s "
-                f"encoder=({encoder_left},{encoder_right}) "
-                f"current={current_ma}mA cpu={cpu_load}%")
+    if reply_type == REPLY_TELEMETRY and len(payload) == TELEMETRY.size:
+        _, sequence, flags = TELEMETRY.unpack(payload)
+        return f"TELEMETRY seq={sequence} [{describe_flags(flags)}]"
 
     if reply_type == REPLY_VERSION and len(payload) == VERSION_REPLY.size:
         _, major, minor = VERSION_REPLY.unpack(payload)
         return f"VERSION {major}.{minor}"
 
-    if reply_type == REPLY_COMMAND_RESULT and len(payload) == COMMAND_RESULT.size:
-        _, host_sequence, command_type, success = COMMAND_RESULT.unpack(payload)
-        name = COMMAND_NAMES.get(command_type, f"0x{command_type:02x}")
-        outcome = "delivered" if success else "failed: no acknowledgement"
-        return f"RESULT seq={host_sequence} command={name} {outcome}"
-
-    if reply_type == REPLY_REQUEST_TIMEOUT and len(payload) == REQUEST_TIMEOUT_NOTICE.size:
-        _, command_type = REQUEST_TIMEOUT_NOTICE.unpack(payload)
-        name = COMMAND_NAMES.get(command_type, f"0x{command_type:02x}")
-        return f"TIMEOUT command={name}"
+    if reply_type == REPLY_STAT and len(payload) == STAT_REPLY.size:
+        _, flags, target_left, target_right = STAT_REPLY.unpack(payload)
+        return (f"STAT [{describe_flags(flags)}] "
+                f"target=({target_left},{target_right})mm/s")
 
     if reply_type == REPLY_LINK_LOST and len(payload) == LINK_LOST_NOTICE.size:
         return "LINK LOST"
@@ -194,7 +190,7 @@ def main():
     threading.Thread(target=reader_thread, args=(port, receiver), daemon=True).start()
 
     sequence = 0
-    print("Commands: arm, stop, move L R, getver, quit")
+    print("Commands: arm, stop, move L R, getver, getstat, quit")
     while True:
         try:
             line = input("> ").strip()
@@ -214,6 +210,8 @@ def main():
             port.write(encode_frame(COMMAND_HEADER.pack(CMD_STOP, sequence)))
         elif line == "getver":
             port.write(encode_frame(COMMAND_HEADER.pack(CMD_GETVER, sequence)))
+        elif line == "getstat":
+            port.write(encode_frame(COMMAND_HEADER.pack(CMD_GETSTAT, sequence)))
         elif line.startswith("move "):
             parts = line.split()
             if len(parts) != 3:
@@ -229,7 +227,7 @@ def main():
                 continue
             port.write(encode_frame(MOVE_COMMAND.pack(CMD_MOVE, sequence, left, right)))
         else:
-            print("Unknown command. Commands: arm, stop, move L R, getver, quit")
+            print("Unknown command. Commands: arm, stop, move L R, getver, getstat, quit")
 
     port.close()
 
