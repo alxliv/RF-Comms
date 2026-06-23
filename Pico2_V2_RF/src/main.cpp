@@ -74,9 +74,6 @@ public:
     // Sequence values are 8-bit and intentionally wrap from 255 back to 0.
     uint8_t next_command_sequence() { return command_sequence_++; }
 
-    bool link_up() const { return link_up_; }
-    void set_link_up(bool up) { link_up_ = up; }
-
     bool poll_due() const { return time_reached(next_poll_); }
     void schedule_poll() { next_poll_ = make_timeout_time_ms(POLL_PERIOD_MS); }
 
@@ -106,7 +103,28 @@ public:
     }
     void print_health();  // defined below, after the PRINTF macro
 
+    // Build and send one command to the Wanderer, stamped with the next
+    // sequence number. Each returns whether the nRF24 acknowledged delivery.
+    // Query answers (GETVER/GETSTAT) arrive later on the downlink stream, not
+    // here. Defined out-of-line below, where transmit_frame() is visible.
+    bool tx_nop_cmd() { return tx_header_cmd(rf_protocol::CMD_NOP); }
+    bool tx_arm_cmd() { return tx_header_cmd(rf_protocol::CMD_ARM); }
+    bool tx_stop_cmd() { return tx_header_cmd(rf_protocol::CMD_STOP); }
+    bool tx_getver_cmd() { return tx_header_cmd(rf_protocol::CMD_GETVER); }
+    bool tx_getstat_cmd() { return tx_header_cmd(rf_protocol::CMD_GETSTAT); }
+    bool tx_move_cmd(int16_t left_mm_s, int16_t right_mm_s);
+
 private:
+    bool tx_header_cmd(uint8_t type);
+
+    // The single primitive for talking to the Wanderer: send one frame, track
+    // the link from the hardware ACK, and dispatch whatever ACK payload came
+    // back. Every command goes through here. Nothing blocks waiting for a
+    // reply; replies arrive on the stream on a later poll.
+    bool transmit_frame(const void *frame, uint8_t length);
+    void update_link(bool delivered);  // link up/down from the ACK result
+    void drain_downlink();             // read + dispatch queued ACK payloads
+
     uint8_t command_sequence_ = 0;
     bool link_up_ = false;
     uint8_t last_sequence_ = 0;
@@ -563,12 +581,12 @@ void dispatch_downlink_frame(const uint8_t *payload, uint8_t length,
     }
 }
 
-void update_base_link(bool delivered, BaseState *state) {
+void BaseState::update_link(bool delivered) {
     // radio.write() returning false means no ACK arrived. It says the RF link
     // failed, not necessarily that this base radio is broken.
     if (!delivered) {
-        if (state->link_up()) {
-            state->set_link_up(false);
+        if (link_up_) {
+            link_up_ = false;
             PRINTF("Base: link lost\r\n");
             const rf_protocol::LinkLostNotice notice{
                 rf_protocol::REPLY_LINK_LOST,
@@ -578,13 +596,13 @@ void update_base_link(bool delivered, BaseState *state) {
         return;
     }
 
-    if (!state->link_up()) {
-        state->set_link_up(true);
+    if (!link_up_) {
+        link_up_ = true;
         PRINTF("Base: link established\r\n");
     }
 }
 
-void drain_downlink(BaseState *state) {
+void BaseState::drain_downlink() {
     while (radio.available()) {
         const uint8_t length = radio.getDynamicPayloadSize();
         if (length == 0) {
@@ -595,21 +613,40 @@ void drain_downlink(BaseState *state) {
 
         uint8_t payload[rf_protocol::MAX_PAYLOAD_SIZE]{};
         radio.read(payload, length);
-        dispatch_downlink_frame(payload, length, state);
+        dispatch_downlink_frame(payload, length, this);
     }
 }
 
-// The single primitive for talking to the Wanderer: send one frame, track the
-// link from the hardware ACK, and dispatch whatever ACK payload came back.
-// Commands and NOP polls all go through here. Nothing blocks waiting for a
-// reply; replies arrive on the stream on a later poll.
-bool transmit_base_frame(const void *frame, uint8_t length, BaseState *state) {
+// ---------------------------------------------------------------------------
+// Base: commands (all fire-and-forget)
+// ---------------------------------------------------------------------------
+
+// The BaseState command methods live here, where the dispatch_downlink_frame()
+// they reach through drain_downlink() is visible. The text CLI and the binary
+// host frame path both call the tx_*_cmd() methods, so the two interfaces
+// cannot diverge in RF behavior.
+
+bool BaseState::transmit_frame(const void *frame, uint8_t length) {
     bool delivered = radio.write(frame, length);
-    update_base_link(delivered, state);
+    update_link(delivered);
     if (delivered) {
-        drain_downlink(state);
+        drain_downlink();
     }
     return delivered;
+}
+
+bool BaseState::tx_header_cmd(uint8_t type) {
+    rf_protocol::CommandHeader command{type, next_command_sequence()};
+    return transmit_frame(&command, sizeof(command));
+}
+
+bool BaseState::tx_move_cmd(int16_t left_mm_s, int16_t right_mm_s) {
+    rf_protocol::MoveCommand command{
+        {rf_protocol::CMD_MOVE, next_command_sequence()},
+        left_mm_s,
+        right_mm_s,
+    };
+    return transmit_frame(&command, sizeof(command));
 }
 
 void poll_wanderer(BaseState *state) {
@@ -618,40 +655,9 @@ void poll_wanderer(BaseState *state) {
     }
     state->schedule_poll();
 
-    const rf_protocol::CommandHeader command{
-        // NOP has no vehicle action. Its purpose is to clock the next downlink
-        // frame (telemetry or a queued reply) back to the base.
-        rf_protocol::CMD_NOP,
-        state->next_command_sequence(),
-    };
-    transmit_base_frame(&command, sizeof(command), state);
-}
-
-// ---------------------------------------------------------------------------
-// Base: commands (all fire-and-forget)
-// ---------------------------------------------------------------------------
-
-// Each perform_*() builds one command and sends it once. The nRF24 hardware
-// ACK is the only delivery confirmation; query answers (GETVER/GETSTAT) come
-// back later on the downlink stream and are handled by the dispatcher. Both
-// the text CLI and the binary host frame path call these, so the two
-// interfaces cannot diverge in RF behavior.
-
-bool perform_header_command(uint8_t command_type, BaseState *state) {
-    const rf_protocol::CommandHeader command{
-        command_type,
-        state->next_command_sequence(),
-    };
-    return transmit_base_frame(&command, sizeof(command), state);
-}
-
-bool perform_move(int16_t left_mm_s, int16_t right_mm_s, BaseState *state) {
-    rf_protocol::MoveCommand command{
-        {rf_protocol::CMD_MOVE, state->next_command_sequence()},
-        left_mm_s,
-        right_mm_s,
-    };
-    return transmit_base_frame(&command, sizeof(command), state);
+    // NOP has no vehicle action. Its purpose is to clock the next downlink
+    // frame (telemetry or a queued reply) back to the base.
+    state->tx_nop_cmd();
 }
 
 void print_base_help() {
@@ -677,28 +683,33 @@ void process_base_command_frame(const uint8_t *payload, uint8_t length,
     rf_protocol::CommandHeader header{};
     std::memcpy(&header, payload, sizeof(header));
 
-    switch (header.type) {
-        case rf_protocol::CMD_ARM:
-        case rf_protocol::CMD_STOP:
-        case rf_protocol::CMD_GETVER:
-        case rf_protocol::CMD_GETSTAT:
-            if (length != sizeof(header)) {
-                return;
-            }
-            perform_header_command(header.type, state);
-            return;
-
-        case rf_protocol::CMD_MOVE: {
-            if (length != sizeof(rf_protocol::MoveCommand)) {
-                return;
-            }
-            rf_protocol::MoveCommand command{};
-            std::memcpy(&command, payload, sizeof(command));
-            perform_move(command.velocity_left_mm_s,
-                         command.velocity_right_mm_s, state);
+    if (header.type == rf_protocol::CMD_MOVE) {
+        if (length != sizeof(rf_protocol::MoveCommand)) {
             return;
         }
+        rf_protocol::MoveCommand command{};
+        std::memcpy(&command, payload, sizeof(command));
+        state->tx_move_cmd(command.velocity_left_mm_s,
+                           command.velocity_right_mm_s);
+        return;
+    }
 
+    if (length != sizeof(header)) {
+        return;
+    }
+    switch (header.type) {
+        case rf_protocol::CMD_ARM:
+            state->tx_arm_cmd();
+            return;
+        case rf_protocol::CMD_STOP:
+            state->tx_stop_cmd();
+            return;
+        case rf_protocol::CMD_GETVER:
+            state->tx_getver_cmd();
+            return;
+        case rf_protocol::CMD_GETSTAT:
+            state->tx_getstat_cmd();
+            return;
         default:
             return;
     }
@@ -711,19 +722,19 @@ void process_base_command_line(char *line, BaseState *state) {
     if (std::strcmp(line, "help") == 0) {
         print_base_help();
     } else if (std::strcmp(line, "arm") == 0) {
-        PRINTF(perform_header_command(rf_protocol::CMD_ARM, state)
+        PRINTF(state->tx_arm_cmd()
                    ? "ARM delivered\r\n"
                    : "ARM failed: no acknowledgement\r\n");
     } else if (std::strcmp(line, "stop") == 0) {
-        PRINTF(perform_header_command(rf_protocol::CMD_STOP, state)
+        PRINTF(state->tx_stop_cmd()
                    ? "STOP delivered\r\n"
                    : "STOP failed: no acknowledgement\r\n");
     } else if (std::strcmp(line, "getver") == 0) {
-        PRINTF(perform_header_command(rf_protocol::CMD_GETVER, state)
+        PRINTF(state->tx_getver_cmd()
                    ? "GETVER sent; version will follow\r\n"
                    : "GETVER failed: no acknowledgement\r\n");
     } else if (std::strcmp(line, "getstat") == 0) {
-        PRINTF(perform_header_command(rf_protocol::CMD_GETSTAT, state)
+        PRINTF(state->tx_getstat_cmd()
                    ? "GETSTAT sent; status will follow\r\n"
                    : "GETSTAT failed: no acknowledgement\r\n");
     } else if (std::strncmp(line, "move ", 5) == 0) {
@@ -749,8 +760,8 @@ void process_base_command_line(char *line, BaseState *state) {
             return;
         }
 
-        PRINTF(perform_move(static_cast<int16_t>(left),
-                            static_cast<int16_t>(right), state)
+        PRINTF(state->tx_move_cmd(static_cast<int16_t>(left),
+                                  static_cast<int16_t>(right))
                    ? "MOVE delivered\r\n"
                    : "MOVE failed: no acknowledgement\r\n");
     } else if (line[0] != '\0') {
