@@ -504,8 +504,9 @@ void update_base_link(bool delivered, BaseState *state) {
 void drain_base_replies(BaseState *state) {
     while (radio.available()) {
         const uint8_t length = radio.getDynamicPayloadSize();
-        if (length == 0 || length > rf_protocol::MAX_PAYLOAD_SIZE) {
-            radio.flush_rx();
+        if (length == 0) {
+            // getDynamicPayloadSize() already flushed RX itself on a
+            // corrupted R_RX_PL_WID read; nothing left to recover here.
             return;
         }
 
@@ -573,9 +574,9 @@ bool request_reply(uint8_t command_type, uint8_t expected_reply_type,
         if (delivered) {
             while (radio.available()) {
                 const uint8_t length = radio.getDynamicPayloadSize();
-                if (length == 0 ||
-                    length > rf_protocol::MAX_PAYLOAD_SIZE) {
-                    radio.flush_rx();
+                if (length == 0) {
+                    // getDynamicPayloadSize() already flushed RX itself on a
+                    // corrupted R_RX_PL_WID read; nothing left to recover.
                     break;
                 }
 
