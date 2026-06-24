@@ -11,7 +11,9 @@ using rf_protocol::TacticalState;
 constexpr uint32_t LIVENESS_TIMEOUT_MS  = 750;
 constexpr int32_t  FALLBACK_DECEL_MM_S2 = 800;   // bounded decel in (mm/s)/s
 
-// Evolution of WandererState: same role (vehicle state), now an explicit FSM.
+// The Wanderer's vehicle state, modeled as an explicit FSM. It owns the
+// commanded targets and the arm/stop/fault gating; the radio layer feeds it
+// commands and reads its outputs.
 class TacticalCore {
 public:
     // Liveness: ANY valid frame from ANY commander, regardless of type (NOP

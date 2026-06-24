@@ -487,7 +487,7 @@ Payload layouts:
 ```text
 Command header       2 bytes: type, sequence
 MOVE command         6 bytes: type, sequence, left velocity, right velocity
-Telemetry            3 bytes: type, sequence, flags
+Telemetry            4 bytes: type, sequence, tactical_state, flags
 Firmware version     3 bytes: type, major, minor
 Status               6 bytes: type, flags, left target, right target
 ```
@@ -526,15 +526,47 @@ Base polling: 100 Hz
 
 The Wanderer accepts `NOP`, `STOP`, `ARM`, `MOVE`, `GETVER`, and `GETSTAT`
 frames with their exact defined lengths. Unknown or malformed commands are
-ignored. The Wanderer is semi-autonomous, so losing the base link does not
-force it to stop; it simply keeps its current targets until a new command
-arrives. Physical motor and sensor integration is not present yet, so
-telemetry currently carries only the sequence and state flags; real sensor
-fields are added when that hardware exists.
+ignored. Physical motor and sensor integration is not present yet, so
+telemetry currently carries only the sequence, the tactical FSM state, and the
+state flags; real sensor fields are added when that hardware exists.
 
 `GETVER` and `GETSTAT` are answered asynchronously: the Wanderer queues the
 reply onto its downlink stream, and it rides the next available ACK ahead of
 routine telemetry. The base does not block waiting for it.
+
+#### Wanderer state machine
+
+The Wanderer's vehicle state is an explicit four-state machine (`TacticalCore`
+in `tactical.h`). The current state rides every telemetry frame in the
+`tactical_state` byte:
+
+```text
+Value  State     Meaning
+0      Safe      Boot / disarmed. Motors gated off; targets forced to zero.
+1      Active    Armed. Emitting the commanded left/right velocity.
+2      Fallback  Commander went silent. Ramping the commanded velocity to zero.
+3      Fault     Latched fault. Motors gated off until explicitly cleared.
+```
+
+Transitions:
+
+- `ARM` moves `Safe -> Active`.
+- `STOP` moves `Active`/`Fallback` -> `Safe`, clearing the targets. It is
+  refused while a fault is latched.
+- `MOVE` sets the targets only in `Active` (ignored in `Safe`/`Fault`). A fresh
+  `MOVE` is also the only thing that resumes from `Fallback`: it returns to
+  `Active`, so the commander must re-assert intent rather than have the vehicle
+  silently re-accelerate.
+- Liveness: any valid frame from any commander (including a bare `NOP`) marks
+  the commander alive. If no frame arrives for 750 ms (`LIVENESS_TIMEOUT_MS`)
+  while `Active`, the Wanderer enters `Fallback` and ramps both targets to zero
+  at a bounded 800 (mm/s)/s (`FALLBACK_DECEL_MM_S2`). This is a controlled stop
+  on link loss, not a latched fault — a new `MOVE` resumes normal operation.
+
+`Fault` is a latched, motors-off state reserved for fault sources added later;
+no command currently raises or clears one. Only `Active` and `Fallback` produce
+motor output, so `WAND_ARMED` is reported in both; `WAND_MOVING` additionally
+requires a non-zero target.
 
 During this development step, USB CDC still carries human-readable diagnostic
 text. Every five seconds the base prints a link-health summary:
@@ -641,9 +673,9 @@ Wanderer stat: armed=yes running=no target=0/0 mm/s
 ```
 
 `move L R` accepts signed 16-bit velocity targets in millimeters per second.
-The Wanderer records targets only while armed. Motor output remains
-unimplemented, so this command currently verifies transport and command
-decoding only.
+The Wanderer records targets only in the `Active` state (see the state machine
+above). Motor output remains unimplemented, so this command currently verifies
+transport and command decoding only.
 
 When the Wanderer is connected to USB CDC, it prints each actionable command
 and the resulting state change. Routine 100 Hz `NOP` polls are intentionally

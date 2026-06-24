@@ -49,6 +49,14 @@ REPLY_STAT = 0x03
 WAND_MOVING = 1 << 0
 WAND_ARMED = 1 << 1
 
+# Vehicle FSM state (rf_protocol::TacticalState) carried in telemetry.
+TACTICAL_STATE_NAMES = {
+    0: "Safe",
+    1: "Active",
+    2: "Fallback",
+    3: "Fault",
+}
+
 COMMAND_HEADER = struct.Struct("<BB")
 MOVE_COMMAND = struct.Struct("<BBhh")
 TELEMETRY = struct.Struct("<BBBB")
@@ -69,6 +77,10 @@ COMMAND_NAMES = {
 def describe_flags(flags: int) -> str:
     return (f"{'armed' if flags & WAND_ARMED else 'disarmed'},"
             f"{'moving' if flags & WAND_MOVING else 'stopped'}")
+
+
+def describe_tactical_state(state: int) -> str:
+    return TACTICAL_STATE_NAMES.get(state, f"0x{state:02x}")
 
 
 def crc16_ccitt(data: bytes) -> int:
@@ -97,8 +109,10 @@ def decode_payload(payload: bytes) -> str:
 
     reply_type = payload[0]
     if reply_type == REPLY_TELEMETRY and len(payload) == TELEMETRY.size:
-        _, sequence, flags = TELEMETRY.unpack(payload)
-        return f"TELEMETRY seq={sequence} [{describe_flags(flags)}]"
+        _, sequence, tactical_state, flags = TELEMETRY.unpack(payload)
+        return (f"TELEMETRY seq={sequence} "
+                f"state={describe_tactical_state(tactical_state)} "
+                f"[{describe_flags(flags)}]")
 
     if reply_type == REPLY_VERSION and len(payload) == VERSION_REPLY.size:
         _, major, minor = VERSION_REPLY.unpack(payload)

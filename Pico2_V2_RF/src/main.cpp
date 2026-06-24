@@ -36,41 +36,6 @@ enum class Role : uint8_t {
     Base,
 };
 
-// The Wanderer's commanded vehicle state; real motor outputs and sensors come
-// later. `armed` is the example state variable: a permission gate MOVE checks
-// before applying targets. This holds vehicle state only -- it is one of the
-// sources telemetry draws from, not the telemetry builder itself.
-class WandererState {
-public:
-    void arm() { armed_ = true; }
-    void stop() {
-        armed_ = false;
-        target_left_mm_s_ = 0;
-        target_right_mm_s_ = 0;
-    }
-    // Applies the targets only while armed; returns false (ignored) otherwise.
-    bool apply_move(int16_t left_mm_s, int16_t right_mm_s) {
-        if (!armed_) {
-            return false;
-        }
-        target_left_mm_s_ = left_mm_s;
-        target_right_mm_s_ = right_mm_s;
-        return true;
-    }
-
-    bool armed() const { return armed_; }
-    int16_t target_left_mm_s() const { return target_left_mm_s_; }
-    int16_t target_right_mm_s() const { return target_right_mm_s_; }
-
-    TacticalCore core;
-
-private:
-    bool armed_ = false;
-    int16_t target_left_mm_s_ = 0;
-    int16_t target_right_mm_s_ = 0;
-
-};
-
 class BaseState {
 public:
     BaseState()
@@ -150,7 +115,7 @@ SPI radio_spi;
 // nRF24 ACK payloads. Telemetry is the default heartbeat; query replies are
 // queued here and sent ahead of telemetry so they are never overwritten. This
 // is radio-layer staging, not vehicle state, so it lives alongside
-// radio/radio_spi rather than inside WandererState.
+// radio/radio_spi rather than inside the TacticalCore.
 struct rfFrame {
     uint8_t length;
     uint8_t bytes[rf_protocol::MAX_PAYLOAD_SIZE];
@@ -283,36 +248,36 @@ bool configure_radio(Role role) {
 // Wanderer: downlink staging
 // ---------------------------------------------------------------------------
 
-// Maps vehicle state to the wire flag bits shared by telemetry and GETSTAT.
-// WAND_MOVING means actually moving (armed with a non-zero target), distinct
-// from WAND_ARMED (allowed to move). This is reporting code, not vehicle
-// state, so it reads WandererState rather than living inside it.
-uint8_t wanderer_flags(const WandererState *wanderer) {
+// Maps the FSM state to the wire flag bits shared by telemetry and GETSTAT.
+// WAND_MOVING means actually moving (motors live with a non-zero target),
+// distinct from WAND_ARMED (motors live, allowed to move). This is reporting
+// code, not vehicle state, so it reads the TacticalCore rather than living
+// inside it. The full FSM state also rides telemetry as tactical_state.
+uint8_t wanderer_flags(const TacticalCore *core) {
     uint8_t flags = 0;
-    if (wanderer->armed()) {
+    if (core->motors_enabled()) {
         flags |= rf_protocol::WAND_ARMED;
     }
-    if (wanderer->armed() &&
-        (wanderer->target_left_mm_s() != 0 ||
-         wanderer->target_right_mm_s() != 0)) {
+    if (core->motors_enabled() &&
+        (core->target_left() != 0 || core->target_right() != 0)) {
         flags |= rf_protocol::WAND_MOVING;
     }
     return flags;
 }
 
 // Assembles the telemetry heartbeat from every source that contributes to it.
-// Today that is just WandererState's command-state flags; battery, odometry,
-// and the rest get folded in here as their hardware lands. It lives outside
-// WandererState precisely because telemetry aggregates multiple sources. The
-// sequence counter belongs to the telemetry stream, not the vehicle, so it
-// lives here too.
-rf_protocol::Telemetry build_telemetry(const WandererState *wanderer) {
+// Today that is just the TacticalCore's FSM state and command-state flags;
+// battery, odometry, and the rest get folded in here as their hardware lands.
+// It lives outside the TacticalCore precisely because telemetry aggregates
+// multiple sources. The sequence counter belongs to the telemetry stream, not
+// the vehicle, so it lives here too.
+rf_protocol::Telemetry build_telemetry(const TacticalCore *core) {
     static uint8_t sequence = 0;
     rf_protocol::Telemetry telemetry{};
     telemetry.type = rf_protocol::REPLY_TELEMETRY;
     telemetry.sequence = sequence++;
-    telemetry.flags = wanderer_flags(wanderer);
-    telemetry.tactical_state = static_cast<uint8_t>(wanderer->core.state());
+    telemetry.flags = wanderer_flags(core);
+    telemetry.tactical_state = static_cast<uint8_t>(core->state());
     return telemetry;
 }
 
@@ -325,23 +290,23 @@ rf_protocol::Telemetry build_telemetry(const WandererState *wanderer) {
 // telemetry heartbeat and is dropped from the queue whether or not the radio
 // accepts it -- we never re-transmit an ACK payload; the base re-asks if it
 // cares.
-bool stage_next_ack_payload(WandererState *state) {
+bool stage_next_ack_payload(TacticalCore *core) {
     if (!rf_queue.empty()) {
         rfFrame frame = rf_queue.front();
         rf_queue.pop();
         return radio.writeAckPayload(RADIO_PIPE, frame.bytes, frame.length);
     }
 
-    rf_protocol::Telemetry telemetry = build_telemetry(state);
+    rf_protocol::Telemetry telemetry = build_telemetry(core);
     return radio.writeAckPayload(RADIO_PIPE, &telemetry, sizeof(telemetry));
 }
 
 // Discards whatever is already staged in the TX FIFO and stages a fresh
 // frame. Used after a state change so the next ACK reflects current state
 // rather than a payload built before the change.
-void restage_ack(WandererState *state) {
+void restage_ack(TacticalCore *core) {
     radio.flush_tx();
-    stage_next_ack_payload(state);
+    stage_next_ack_payload(core);
 }
 
 // ---------------------------------------------------------------------------
@@ -349,7 +314,7 @@ void restage_ack(WandererState *state) {
 // ---------------------------------------------------------------------------
 
 bool handle_wanderer_command(const uint8_t *payload, uint8_t length,
-                             WandererState *state) {
+                             TacticalCore *core, absolute_time_t now) {
     // Never cast and trust arbitrary radio bytes. First verify the exact
     // length, then copy into the packed protocol structure.
     if (length < sizeof(rf_protocol::CommandHeader)) {
@@ -367,7 +332,7 @@ bool handle_wanderer_command(const uint8_t *payload, uint8_t length,
             if (length != sizeof(rf_protocol::CommandHeader)) {
                 return false;
             }
-            state->stop();
+            core->cmd_stop(now);
             PRINTF("Command STOP seq=%u: disarmed, targets cleared\r\n",
                    header.sequence);
             return true;
@@ -376,7 +341,7 @@ bool handle_wanderer_command(const uint8_t *payload, uint8_t length,
             if (length != sizeof(rf_protocol::CommandHeader)) {
                 return false;
             }
-            state->arm();
+            core->cmd_arm(now);
             PRINTF("Command ARM seq=%u: armed\r\n", header.sequence);
             return true;
 
@@ -386,13 +351,13 @@ bool handle_wanderer_command(const uint8_t *payload, uint8_t length,
             }
             rf_protocol::MoveCommand command{};
             std::memcpy(&command, payload, sizeof(command));
-            if (state->apply_move(command.velocity_left_mm_s,
-                                  command.velocity_right_mm_s)) {
+            if (core->cmd_move(command.velocity_left_mm_s,
+                               command.velocity_right_mm_s, now)) {
                 PRINTF("Command MOVE seq=%u: left=%d right=%d mm/s\r\n",
                        command.header.sequence, command.velocity_left_mm_s,
                        command.velocity_right_mm_s);
             } else {
-                PRINTF("Command MOVE seq=%u ignored: Wanderer is not armed\r\n",
+                PRINTF("Command MOVE seq=%u ignored: Wanderer is not active\r\n",
                        command.header.sequence);
             }
             return true;
@@ -421,9 +386,9 @@ bool handle_wanderer_command(const uint8_t *payload, uint8_t length,
             {
                 rf_protocol::StatReply reply{
                     rf_protocol::REPLY_STAT,
-                    wanderer_flags(state),
-                    state->target_left_mm_s(),
-                    state->target_right_mm_s(),
+                    wanderer_flags(core),
+                    core->target_left(),
+                    core->target_right(),
                 };
                 rf_queue.push(&reply, sizeof(reply));
             }
@@ -436,7 +401,7 @@ bool handle_wanderer_command(const uint8_t *payload, uint8_t length,
     }
 }
 
-void process_wanderer_radio(WandererState *state) {
+void process_wanderer_radio(TacticalCore *core) {
     // Drain every received command. The nRF24 hardware has already discarded
     // packets that failed its CRC before they can appear in this FIFO.
     uint8_t pipe = 0;
@@ -447,22 +412,23 @@ void process_wanderer_radio(WandererState *state) {
             // means it detected a corrupted R_RX_PL_WID read (a known nRF24
             // SPI erratum) and recovered. RX is already clean; only the
             // ACK-payload TX FIFO is still our responsibility.
-            restage_ack(state);
+            restage_ack(core);
             return;
         }
 
         uint8_t payload[rf_protocol::MAX_PAYLOAD_SIZE]{};
         radio.read(payload, length);
-        state->core.note_commander_alive(get_absolute_time());
+        const absolute_time_t now = get_absolute_time();
+        core->note_commander_alive(now);
         if (pipe == RADIO_PIPE) {
-            handle_wanderer_command(payload, length, state);
+            handle_wanderer_command(payload, length, core, now);
         }
 
-        if (!stage_next_ack_payload(state)) {
+        if (!stage_next_ack_payload(core)) {
             // The ACK payload uses the three-entry TX FIFO. A failed queue
             // operation means stale entries filled it; discard them and put
             // back one fresh frame.
-            restage_ack(state);
+            restage_ack(core);
         }
     }
 }
@@ -890,7 +856,7 @@ int main() {
     gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
     gpio_put(PICO_DEFAULT_LED_PIN, false);
 
-    WandererState wanderer;
+    TacticalCore wanderer;
     BaseState base;
 
     if (radio_ready && role == Role::Wanderer) {
@@ -911,13 +877,13 @@ int main() {
                 poll_base_usb(&base);
                 poll_wanderer(&base);
             } else {
-                TacticalState before = wanderer.core.state();
+                TacticalState before = wanderer.state();
                 process_wanderer_radio(&wanderer);
-                wanderer.core.tick(get_absolute_time());
-                if (wanderer.core.state() != before) {
+                wanderer.tick(get_absolute_time());
+                if (wanderer.state() != before) {
                     PRINTF("TacticalState changed. From %u to %u\n",
                            static_cast<unsigned>(before),
-                           static_cast<unsigned>(wanderer.core.state()));
+                           static_cast<unsigned>(wanderer.state()));
                 }
 
             }
