@@ -881,7 +881,7 @@ int main() {
                 process_wanderer_radio(&wanderer);
                 wanderer.tick(get_absolute_time());
                 if (wanderer.state() != before) {
-                    PRINTF("TacticalState changed. From %u to %u\n",
+                    PRINTF("TacticalState changed. From %u to %u\r\n",
                            static_cast<unsigned>(before),
                            static_cast<unsigned>(wanderer.state()));
                 }

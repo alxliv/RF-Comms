@@ -23,6 +23,7 @@ CRC16-CCITT: init 0xFFFF, poly 0x1021, MSB-first (same algorithm as
 Pico2_V1_RF/src/protocol.c and the base firmware).
 """
 
+import shutil
 import struct
 import sys
 import threading
@@ -144,13 +145,16 @@ class FrameReceiver:
         self.frame_crc = bytearray()
 
     def feed(self, byte: int):
+        """Returns ("text", line) for a completed plain-text line, ("frame",
+        payload) for a CRC-valid binary frame, or None otherwise."""
         if self.state == self.TEXT:
             if byte == FRAME_SYNC:
                 self.state = self.LENGTH
             elif byte in (0x0D, 0x0A):
                 if self.text_line:
-                    print(f"[base] {self.text_line.decode(errors='replace')}")
+                    line = self.text_line.decode(errors="replace")
                     self.text_line.clear()
+                    return ("text", line)
             else:
                 self.text_line.append(byte)
             return None
@@ -180,18 +184,72 @@ class FrameReceiver:
         expected = self.frame_crc[0] | (self.frame_crc[1] << 8)
         body = bytes([self.frame_length]) + bytes(self.frame_payload)
         if expected == crc16_ccitt(body):
-            return bytes(self.frame_payload)
+            return ("frame", bytes(self.frame_payload))
         return None  # CRC mismatch: drop the frame, resync on next FRAME_SYNC
 
 
-def reader_thread(port: serial.Serial, receiver: FrameReceiver):
+# Telemetry arrives ~100x/sec, far faster than a human can read scrolling
+# lines, so it's redrawn in place on one line instead of being printed.
+STATUS_REDRAW_INTERVAL = 0.1  # seconds; caps the redraw rate to ~10 Hz
+
+
+class StatusLine:
+    """Renders fast-changing telemetry on a single, in-place terminal line
+    while other output (text diagnostics, replies, link-lost) still scrolls
+    normally above it."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._text = ""
+        self._last_draw = 0.0
+
+    @staticmethod
+    def _fit_to_width(text: str) -> str:
+        # Truncate to the terminal width so the line can never wrap; a
+        # wrapped status line breaks the "\r"/clear-line redraw below,
+        # since that only ever addresses the cursor's current row.
+        width = shutil.get_terminal_size(fallback=(80, 24)).columns
+        return text[: width - 1] if width > 1 else text
+
+    def update(self, text: str):
+        now = time.monotonic()
+        with self._lock:
+            if now - self._last_draw < STATUS_REDRAW_INTERVAL:
+                return
+            self._draw(text)
+
+    def _draw(self, text: str):
+        text = self._fit_to_width(text)
+        sys.stdout.write("\r\x1b[2K" + text)
+        sys.stdout.flush()
+        self._text = text
+        self._last_draw = time.monotonic()
+
+    def println(self, text: str):
+        with self._lock:
+            sys.stdout.write("\r\x1b[2K")
+            print(text)
+            if self._text:
+                sys.stdout.write(self._text)
+                sys.stdout.flush()
+
+
+def reader_thread(port: serial.Serial, receiver: FrameReceiver, status: StatusLine):
     while True:
         data = port.read(1)
         if not data:
             continue
-        payload = receiver.feed(data[0])
-        if payload is not None:
-            print(decode_payload(payload))
+        result = receiver.feed(data[0])
+        if result is None:
+            continue
+        _, value = result
+        if isinstance(value, str):
+            status.println(f"[base] {value}")
+            continue
+        if value and value[0] == REPLY_TELEMETRY:
+            status.update(decode_payload(value))
+        else:
+            status.println(decode_payload(value))
 
 
 def main():
@@ -201,7 +259,8 @@ def main():
 
     port = serial.Serial(sys.argv[1], baudrate=115200, timeout=0.1)
     receiver = FrameReceiver()
-    threading.Thread(target=reader_thread, args=(port, receiver), daemon=True).start()
+    status = StatusLine()
+    threading.Thread(target=reader_thread, args=(port, receiver, status), daemon=True).start()
 
     sequence = 0
     print("Commands: arm, stop, move L R, getver, getstat, quit")
