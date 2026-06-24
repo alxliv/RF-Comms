@@ -253,11 +253,11 @@ def reader_thread(port: serial.Serial, receiver: FrameReceiver, status: StatusLi
 
 
 def main():
-    if len(sys.argv) != 2:
-        print(f"Usage: python {sys.argv[0]} <serial-port>")
-        sys.exit(1)
+    comport = 'COM4'
+    if len(sys.argv) >= 2:
+        comport = sys.argv[1]
 
-    port = serial.Serial(sys.argv[1], baudrate=115200, timeout=0.1)
+    port = serial.Serial(comport, baudrate=115200, timeout=0.1)
     receiver = FrameReceiver()
     status = StatusLine()
     threading.Thread(target=reader_thread, args=(port, receiver, status), daemon=True).start()
