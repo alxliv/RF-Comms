@@ -5,6 +5,9 @@
 #include "RF24.h"
 #include "pico/stdlib.h"
 #include "protocol.h"
+#include "tactical.h"
+
+using rf_protocol::TacticalState;
 
 namespace {
 
@@ -59,10 +62,13 @@ public:
     int16_t target_left_mm_s() const { return target_left_mm_s_; }
     int16_t target_right_mm_s() const { return target_right_mm_s_; }
 
+    TacticalCore core;
+
 private:
     bool armed_ = false;
     int16_t target_left_mm_s_ = 0;
     int16_t target_right_mm_s_ = 0;
+
 };
 
 class BaseState {
@@ -306,6 +312,7 @@ rf_protocol::Telemetry build_telemetry(const WandererState *wanderer) {
     telemetry.type = rf_protocol::REPLY_TELEMETRY;
     telemetry.sequence = sequence++;
     telemetry.flags = wanderer_flags(wanderer);
+    telemetry.tactical_state = static_cast<uint8_t>(wanderer->core.state());
     return telemetry;
 }
 
@@ -446,7 +453,7 @@ void process_wanderer_radio(WandererState *state) {
 
         uint8_t payload[rf_protocol::MAX_PAYLOAD_SIZE]{};
         radio.read(payload, length);
-
+        state->core.note_commander_alive(get_absolute_time());
         if (pipe == RADIO_PIPE) {
             handle_wanderer_command(payload, length, state);
         }
@@ -904,7 +911,15 @@ int main() {
                 poll_base_usb(&base);
                 poll_wanderer(&base);
             } else {
+                TacticalState before = wanderer.core.state();
                 process_wanderer_radio(&wanderer);
+                wanderer.core.tick(get_absolute_time());
+                if (wanderer.core.state() != before) {
+                    PRINTF("TacticalState changed. From %u to %u\n",
+                           static_cast<unsigned>(before),
+                           static_cast<unsigned>(wanderer.core.state()));
+                }
+
             }
         }
 

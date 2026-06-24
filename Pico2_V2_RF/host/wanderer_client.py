@@ -51,7 +51,7 @@ WAND_ARMED = 1 << 1
 
 COMMAND_HEADER = struct.Struct("<BB")
 MOVE_COMMAND = struct.Struct("<BBhh")
-TELEMETRY = struct.Struct("<BBB")
+TELEMETRY = struct.Struct("<BBBB")
 VERSION_REPLY = struct.Struct("<BBB")
 STAT_REPLY = struct.Struct("<BBhh")
 LINK_LOST_NOTICE = struct.Struct("<B")

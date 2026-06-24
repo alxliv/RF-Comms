@@ -56,12 +56,20 @@ struct __attribute__((packed)) MoveCommand {
     int16_t velocity_right_mm_s;
 };
 
+enum class TacticalState : uint8_t {
+    Safe     = 0,  // boot: disarmed, motors gated off
+    Active   = 1,  // armed: emitting the commanded velocity
+    Fallback = 2,  // no live commander: ramping commanded velocity to zero
+    Fault    = 3,  // latched fault: motors gated off until explicitly cleared
+};
+
 // The continuous monitoring heartbeat. It currently carries only the sequence
 // (for gap/rate stats) and the state flags. Real sensor fields (battery,
 // encoders, velocity, ...) are added here when that hardware exists.
 struct __attribute__((packed)) Telemetry {
     uint8_t type;
     uint8_t sequence;
+    uint8_t tactical_state;
     uint8_t flags;
 };
 
@@ -89,7 +97,7 @@ struct __attribute__((packed)) LinkLostNotice {
 
 static_assert(sizeof(CommandHeader) == 2);
 static_assert(sizeof(MoveCommand) == 6);
-static_assert(sizeof(Telemetry) == 3);
+static_assert(sizeof(Telemetry) == 4);
 static_assert(sizeof(VersionReply) == 3);
 static_assert(sizeof(StatReply) == 6);
 static_assert(sizeof(LinkLostNotice) == 1);
