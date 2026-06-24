@@ -24,7 +24,7 @@ constexpr uint8_t RADIO_CHANNEL = 76;
 constexpr uint8_t RADIO_PIPE = 1;
 constexpr uint32_t POLL_PERIOD_MS = 10;
 constexpr uint32_t RADIO_HEALTH_PERIOD_MS = 1000;
-constexpr uint32_t TELEMETRY_REPORT_MS = 5000;
+constexpr uint32_t RF_REPORT_PERIOD_MS = 1000;  // `rf on` auto-repeat cadence
 constexpr size_t COMMAND_LINE_SIZE = 64;
 constexpr uint8_t RADIO_ADDRESS[5] = {'V', '2', 'R', 'F', '1'};
 
@@ -38,9 +38,7 @@ enum class Role : uint8_t {
 
 class BaseState {
 public:
-    BaseState()
-        : report_started_(get_absolute_time()),
-          next_poll_(get_absolute_time()) {}
+    BaseState() : next_poll_(get_absolute_time()) {}
 
     // Sequence values are 8-bit and intentionally wrap from 255 back to 0.
     uint8_t next_command_sequence() { return command_sequence_++; }
@@ -48,42 +46,65 @@ public:
     bool poll_due() const { return time_reached(next_poll_); }
     void schedule_poll() { next_poll_ = make_timeout_time_ms(POLL_PERIOD_MS); }
 
-    // Records one received telemetry packet and updates gap statistics.
-    // Returns true only for the very first packet ever received: unsigned 8-bit
-    // subtraction handles wraparound (last=255, current=0 is an advance of 1,
-    // not a gap), and the first packet only seeds the baseline.
-    bool record_telemetry(uint8_t sequence) {
-        bool first = telemetry_received_ == 0;
-        ++telemetry_received_;
-        if (!first) {
-            const uint8_t advance =
-                static_cast<uint8_t>(sequence - last_sequence_);
-            if (advance > 1) {
-                telemetry_gaps_ += static_cast<uint32_t>(advance - 1u);
-            }
-        }
-        last_sequence_ = sequence;
-        return first;
+    // Telemetry forwarding control: the `tlm` command. The base always polls
+    // the Wanderer at POLL_PERIOD_MS regardless; this only decimates what is
+    // forwarded to the laptop as `#` lines. Default off, so a human attaching a
+    // terminal gets a clean console instead of the full-rate firehose.
+    void telemetry_off() { forward_on_ = false; }
+    void telemetry_every_frame() {
+        forward_on_ = true;
+        forward_interval_ms_ = 0;
+    }
+    void telemetry_rate(uint32_t hz) {
+        forward_on_ = true;
+        forward_interval_ms_ = hz != 0 ? 1000u / hz : 0;
+        next_forward_ = get_absolute_time();
+    }
+    // True when the `#` line for the frame just received should be forwarded.
+    bool forward_telemetry_due() {
+        if (!forward_on_) return false;
+        if (forward_interval_ms_ == 0) return true;
+        if (!time_reached(next_forward_)) return false;
+        next_forward_ = make_timeout_time_ms(forward_interval_ms_);
+        return true;
     }
 
-    uint8_t last_flags() const { return last_flags_; }
-    void set_last_flags(uint8_t flags) { last_flags_ = flags; }
+    // `!state` is derived by watching tactical_state change across the
+    // telemetry the base receives internally, so it fires even while `#`
+    // forwarding is off. Defined out-of-line below, where the PRINTF macro and
+    // the state-name helper are visible.
+    void observe_telemetry_state(uint8_t state);
 
-    bool health_report_due() const {
-        return time_reached(delayed_by_ms(report_started_, TELEMETRY_REPORT_MS));
+    // nRF24 link statistics (the `rf` command). Every frame the base sends is
+    // counted by delivery so the ACK success ratio reflects link quality --
+    // the primary metric for a range test. `rf on` repeats the report once a
+    // second; `report_rf_stats()` emits one `>rf` line and resets the window.
+    void rf_auto_enable() {
+        rf_auto_ = true;
+        next_rf_report_ = make_timeout_time_ms(RF_REPORT_PERIOD_MS);
     }
-    void print_health();  // defined below, after the PRINTF macro
+    void rf_auto_disable() { rf_auto_ = false; }
+    bool rf_report_due() {
+        if (!rf_auto_ || !time_reached(next_rf_report_)) return false;
+        next_rf_report_ = make_timeout_time_ms(RF_REPORT_PERIOD_MS);
+        return true;
+    }
+    void report_rf_stats();
 
     // Build and send one command to the Wanderer, stamped with the next
-    // sequence number. Each returns whether the nRF24 acknowledged delivery.
-    // Query answers (GETVER/GETSTAT) arrive later on the downlink stream, not
-    // here. Defined out-of-line below, where transmit_frame() is visible.
+    // sequence number. Each returns whether the nRF24 acknowledged delivery,
+    // but the text `=ok` ack does not depend on that -- it is emitted before
+    // the frame goes over the air. Query answers (GETVER/GETSTAT) arrive later
+    // on the downlink stream. Defined out-of-line below, where transmit_frame()
+    // is visible.
     bool tx_nop_cmd() { return tx_header_cmd(rf_protocol::CMD_NOP); }
     bool tx_arm_cmd() { return tx_header_cmd(rf_protocol::CMD_ARM); }
     bool tx_stop_cmd() { return tx_header_cmd(rf_protocol::CMD_STOP); }
     bool tx_getver_cmd() { return tx_header_cmd(rf_protocol::CMD_GETVER); }
     bool tx_getstat_cmd() { return tx_header_cmd(rf_protocol::CMD_GETSTAT); }
+    bool tx_getpa_cmd() { return tx_header_cmd(rf_protocol::CMD_GETPA); }
     bool tx_move_cmd(int16_t left_mm_s, int16_t right_mm_s);
+    bool tx_setpa_cmd(uint8_t pa_level);
 
 private:
     bool tx_header_cmd(uint8_t type);
@@ -93,18 +114,24 @@ private:
     // back. Every command goes through here. Nothing blocks waiting for a
     // reply; replies arrive on the stream on a later poll.
     bool transmit_frame(const void *frame, uint8_t length);
-    void update_link(bool delivered);  // link up/down from the ACK result
+    void update_link(bool delivered);  // link up/down -> `!link` events
     void drain_downlink();             // read + dispatch queued ACK payloads
 
     uint8_t command_sequence_ = 0;
     bool link_up_ = false;
-    uint8_t last_sequence_ = 0;
-    uint32_t telemetry_received_ = 0;
-    uint32_t telemetry_received_at_report_ = 0;
-    uint32_t telemetry_gaps_ = 0;
-    uint32_t telemetry_gaps_at_report_ = 0;
-    uint8_t last_flags_ = 0;
-    absolute_time_t report_started_;
+    bool forward_on_ = false;           // `#` off until `tlm on|<hz>`
+    uint32_t forward_interval_ms_ = 0;  // 0 = forward every frame
+    bool have_state_ = false;           // seen at least one telemetry frame
+    uint8_t last_state_ = 0;            // last tactical_state, for `!state`
+    // RF link counters: lifetime totals and the snapshot taken at the last
+    // `>rf` report, so each report covers only the interval since the previous.
+    uint32_t tx_total_ = 0;
+    uint32_t tx_ok_ = 0;
+    uint32_t tx_total_at_report_ = 0;
+    uint32_t tx_ok_at_report_ = 0;
+    bool rf_auto_ = false;
+    absolute_time_t next_rf_report_ = {};
+    absolute_time_t next_forward_ = {};
     absolute_time_t next_poll_;
 };
 
@@ -169,45 +196,6 @@ rfQueue rf_queue;
     } while (0)
 
 namespace {
-
-// Matches Pico2_V1_RF/src/protocol.c crc16_ccitt: init 0xFFFF, poly 0x1021,
-// MSB-first. Used to checksum binary host frames on the base's USB CDC link.
-uint16_t crc16_ccitt(const uint8_t *data, std::size_t length) {
-    uint16_t crc = 0xFFFF;
-    for (std::size_t index = 0; index < length; ++index) {
-        crc ^= static_cast<uint16_t>(data[index]) << 8;
-        for (uint8_t bit = 0; bit < 8; ++bit) {
-            crc = (crc & 0x8000u) != 0
-                      ? static_cast<uint16_t>((crc << 1) ^ 0x1021u)
-                      : static_cast<uint16_t>(crc << 1);
-        }
-    }
-    return crc;
-}
-
-// Writes [FRAME_SYNC][length][payload][crc_lo][crc_hi] to the base's USB CDC
-// link. The CRC covers the length byte and payload, matching the receive
-// side in poll_base_usb(). This is the binary counterpart to the text CLI,
-// intended for a host program rather than a human terminal.
-void send_host_frame(const void *payload, uint8_t length) {
-    if (!stdio_usb_connected() ||
-        length > rf_protocol::MAX_PAYLOAD_SIZE) {
-        return;
-    }
-
-    uint8_t frame[2 + rf_protocol::MAX_PAYLOAD_SIZE + 2];
-    frame[0] = rf_protocol::FRAME_SYNC;
-    frame[1] = length;
-    std::memcpy(frame + 2, payload, length);
-
-    const uint16_t crc =
-        crc16_ccitt(frame + 1, static_cast<std::size_t>(length) + 1);
-    frame[2 + length] = static_cast<uint8_t>(crc & 0xFFu);
-    frame[3 + length] = static_cast<uint8_t>(crc >> 8);
-
-    std::fwrite(frame, 1, static_cast<std::size_t>(length) + 4, stdout);
-    std::fflush(stdout);
-}
 
 Role read_role() {
     // The pulldown makes an unconnected role pin safely select Wanderer.
@@ -396,6 +384,43 @@ bool handle_wanderer_command(const uint8_t *payload, uint8_t length,
                    header.sequence);
             return true;
 
+        case rf_protocol::CMD_GETPA:
+            if (length != sizeof(rf_protocol::CommandHeader)) {
+                return false;
+            }
+            {
+                rf_protocol::PaReply reply{
+                    rf_protocol::REPLY_PA,
+                    radio.getPALevel(),
+                };
+                rf_queue.push(&reply, sizeof(reply));
+            }
+            PRINTF("Command GETPA seq=%u: pa reply queued\r\n",
+                   header.sequence);
+            return true;
+
+        case rf_protocol::CMD_SETPA: {
+            if (length != sizeof(rf_protocol::SetPaCommand)) {
+                return false;
+            }
+            rf_protocol::SetPaCommand command{};
+            std::memcpy(&command, payload, sizeof(command));
+            if (command.pa_level <= 3) {
+                radio.setPALevel(command.pa_level);
+            }
+            // Answer with the level actually in effect, so "try to set" is
+            // confirmed by read-back rather than assumed. An out-of-range value
+            // leaves the PA untouched and the reply shows it stayed put.
+            rf_protocol::PaReply reply{
+                rf_protocol::REPLY_PA,
+                radio.getPALevel(),
+            };
+            rf_queue.push(&reply, sizeof(reply));
+            PRINTF("Command SETPA seq=%u: pa=%u applied, reply queued\r\n",
+                   command.header.sequence, radio.getPALevel());
+            return true;
+        }
+
         default:
             return false;
     }
@@ -434,68 +459,40 @@ void process_wanderer_radio(TacticalCore *core) {
 }
 
 // ---------------------------------------------------------------------------
-// Base: link tracking and telemetry health
+// Base: link tracking and telemetry-derived events
 // ---------------------------------------------------------------------------
 
-// Prints the measured frames/second over the latest interval and resets the
-// window. The first gap number is new gaps in this interval; the second is the
-// total since boot.
-void BaseState::print_health() {
-    const absolute_time_t now = get_absolute_time();
-    const int64_t elapsed_us = absolute_time_diff_us(report_started_, now);
-    const uint32_t interval_frames =
-        telemetry_received_ - telemetry_received_at_report_;
-    const uint32_t interval_gaps = telemetry_gaps_ - telemetry_gaps_at_report_;
-
-    uint32_t rate_tenths = 0;
-    if (elapsed_us > 0) {
-        rate_tenths = static_cast<uint32_t>(
-            (static_cast<uint64_t>(interval_frames) * 10000000u) /
-            static_cast<uint64_t>(elapsed_us));
+// The FSM state name carried in `#` telemetry and `!state` events. Names, not
+// raw enum numbers, per PROTOCOL.md -- readability is the point on this link.
+const char *tactical_state_name(uint8_t state) {
+    switch (static_cast<TacticalState>(state)) {
+        case TacticalState::Safe:     return "SAFE";
+        case TacticalState::Active:   return "ACTIVE";
+        case TacticalState::Fallback: return "FALLBACK";
+        case TacticalState::Fault:    return "FAULT";
     }
-
-    PRINTF("Telemetry OK: rate=%lu.%lu Hz total=%lu gaps=%lu/%lu\r\n",
-           static_cast<unsigned long>(rate_tenths / 10u),
-           static_cast<unsigned long>(rate_tenths % 10u),
-           static_cast<unsigned long>(telemetry_received_),
-           static_cast<unsigned long>(interval_gaps),
-           static_cast<unsigned long>(telemetry_gaps_));
-
-    telemetry_received_at_report_ = telemetry_received_;
-    telemetry_gaps_at_report_ = telemetry_gaps_;
-    report_started_ = now;
+    return "?";
 }
 
-void report_wanderer_state(uint8_t flags, bool first_telemetry,
-                           BaseState *state) {
-    // Normal state is not printed repeatedly. State transitions are more
-    // useful to a person watching the terminal than five-second repetitions.
-    bool running = (flags & rf_protocol::WAND_MOVING) != 0;
-
-    if (first_telemetry) {
-        // The very first telemetry packet has no real prior flags to diff
-        // against, so report the starting state instead of a transition.
-        PRINTF("Wanderer state: running=%s\r\n", running ? "yes" : "no");
-        return;
+// Emits `!state from=.. to=..` when the Wanderer's FSM state changes. Driven by
+// every telemetry frame the base receives internally, so the event fires even
+// when `#` forwarding is off. The first frame only seeds the baseline.
+void BaseState::observe_telemetry_state(uint8_t state) {
+    if (have_state_ && state != last_state_) {
+        PRINTF("!state from=%s to=%s\r\n", tactical_state_name(last_state_),
+               tactical_state_name(state));
     }
-
-    bool was_running =
-        (state->last_flags() & rf_protocol::WAND_MOVING) != 0;
-
-    if (running != was_running) {
-        PRINTF("Wanderer movement state: %s\r\n",
-               running ? "running" : "stopped");
-    }
+    have_state_ = true;
+    last_state_ = state;
 }
 
 // ---------------------------------------------------------------------------
 // Base: the one downlink dispatcher
 // ---------------------------------------------------------------------------
 
-// Every frame the Wanderer sends arrives here, identified by its type byte.
-// Telemetry feeds monitoring; query replies are handled if known and logged if
-// not. Each frame is also forwarded verbatim to the host so a laptop client
-// sees the same asynchronous stream the base does.
+// Every frame the Wanderer sends arrives here, identified by its type byte, and
+// is translated into one text line for the laptop: telemetry to `#` (subject to
+// `tlm` forwarding control and feeding `!state` events), query answers to `>`.
 void dispatch_downlink_frame(const uint8_t *payload, uint8_t length,
                              BaseState *state) {
     if (length == 0) {
@@ -509,14 +506,14 @@ void dispatch_downlink_frame(const uint8_t *payload, uint8_t length,
             }
             rf_protocol::Telemetry telemetry{};
             std::memcpy(&telemetry, payload, sizeof(telemetry));
-            bool first_telemetry =
-                state->record_telemetry(telemetry.sequence);
-            report_wanderer_state(telemetry.flags, first_telemetry, state);
-            state->set_last_flags(telemetry.flags);
-            send_host_frame(&telemetry, sizeof(telemetry));
-
-            if (state->health_report_due()) {
-                state->print_health();
+            // Event derivation runs on every frame, independent of forwarding.
+            state->observe_telemetry_state(telemetry.tactical_state);
+            if (state->forward_telemetry_due()) {
+                PRINTF("#seq=%u state=%s armed=%d moving=%d\r\n",
+                       telemetry.sequence,
+                       tactical_state_name(telemetry.tactical_state),
+                       (telemetry.flags & rf_protocol::WAND_ARMED) ? 1 : 0,
+                       (telemetry.flags & rf_protocol::WAND_MOVING) ? 1 : 0);
             }
             return;
         }
@@ -527,9 +524,8 @@ void dispatch_downlink_frame(const uint8_t *payload, uint8_t length,
             }
             rf_protocol::VersionReply version{};
             std::memcpy(&version, payload, sizeof(version));
-            PRINTF("Wanderer version=%u.%u\r\n", version.firmware_major,
+            PRINTF(">ver fw=%u.%u\r\n", version.firmware_major,
                    version.firmware_minor);
-            send_host_frame(&version, sizeof(version));
             return;
         }
 
@@ -539,40 +535,76 @@ void dispatch_downlink_frame(const uint8_t *payload, uint8_t length,
             }
             rf_protocol::StatReply stat{};
             std::memcpy(&stat, payload, sizeof(stat));
-            PRINTF("Wanderer stat: armed=%s running=%s target=%d/%d mm/s\r\n",
-                   (stat.flags & rf_protocol::WAND_ARMED) ? "yes" : "no",
-                   (stat.flags & rf_protocol::WAND_MOVING) ? "yes" : "no",
+            PRINTF(">stat armed=%d moving=%d vL=%d vR=%d\r\n",
+                   (stat.flags & rf_protocol::WAND_ARMED) ? 1 : 0,
+                   (stat.flags & rf_protocol::WAND_MOVING) ? 1 : 0,
                    stat.target_left_mm_s, stat.target_right_mm_s);
-            send_host_frame(&stat, sizeof(stat));
+            return;
+        }
+
+        case rf_protocol::REPLY_PA: {
+            if (length != sizeof(rf_protocol::PaReply)) {
+                return;
+            }
+            rf_protocol::PaReply pa{};
+            std::memcpy(&pa, payload, sizeof(pa));
+            PRINTF(">pa=%u\r\n", pa.pa_level);
             return;
         }
 
         default:
-            PRINTF("Downlink: unknown frame type=0x%02X len=%u\r\n",
+            PRINTF("*downlink: unknown frame type=0x%02X len=%u\r\n",
                    payload[0], length);
             return;
     }
 }
 
 void BaseState::update_link(bool delivered) {
+    // Every transmit is one sample of link quality: counted here so the `rf`
+    // report's ACK ratio reflects the NOP poll stream plus any commands.
+    ++tx_total_;
+    if (delivered) {
+        ++tx_ok_;
+    }
+
     // radio.write() returning false means no ACK arrived. It says the RF link
     // failed, not necessarily that this base radio is broken.
     if (!delivered) {
         if (link_up_) {
             link_up_ = false;
-            PRINTF("Base: link lost\r\n");
-            const rf_protocol::LinkLostNotice notice{
-                rf_protocol::REPLY_LINK_LOST,
-            };
-            send_host_frame(&notice, sizeof(notice));
+            PRINTF("!link down\r\n");
         }
         return;
     }
 
     if (!link_up_) {
         link_up_ = true;
-        PRINTF("Base: link established\r\n");
+        PRINTF("!link up\r\n");
     }
+}
+
+// Emits one `>rf` line and resets the measurement window. sent/ok/lost cover
+// only the interval since the previous report, so an `rf on` stream shows the
+// link's instantaneous behavior. arc is the last packet's auto-retransmit count
+// (0-15, a rough signal-margin proxy) and rpd is the received-power detector
+// (1 = last received signal >= -64 dBm) -- both read live from the radio, along
+// with pa_base, the base's own PA level (0..3). The Wanderer's PA is on the
+// remote board, so it is queried over RF and arrives separately as `>pa=`.
+void BaseState::report_rf_stats() {
+    const uint32_t sent = tx_total_ - tx_total_at_report_;
+    const uint32_t ok = tx_ok_ - tx_ok_at_report_;
+    tx_total_at_report_ = tx_total_;
+    tx_ok_at_report_ = tx_ok_;
+
+    PRINTF(">rf link=%s sent=%lu ok=%lu lost=%lu arc=%u rpd=%d chan=%u "
+           "pa_base=%u\r\n",
+           link_up_ ? "up" : "down", static_cast<unsigned long>(sent),
+           static_cast<unsigned long>(ok),
+           static_cast<unsigned long>(sent - ok), radio.getARC(),
+           radio.testRPD() ? 1 : 0, radio.getChannel(), radio.getPALevel());
+
+    // Ask the Wanderer for its PA; the `>pa=` reply follows on a later poll.
+    tx_getpa_cmd();
 }
 
 void BaseState::drain_downlink() {
@@ -595,9 +627,8 @@ void BaseState::drain_downlink() {
 // ---------------------------------------------------------------------------
 
 // The BaseState command methods live here, where the dispatch_downlink_frame()
-// they reach through drain_downlink() is visible. The text CLI and the binary
-// host frame path both call the tx_*_cmd() methods, so the two interfaces
-// cannot diverge in RF behavior.
+// they reach through drain_downlink() is visible. The text protocol command
+// handler calls these tx_*_cmd() methods.
 
 bool BaseState::transmit_frame(const void *frame, uint8_t length) {
     bool delivered = radio.write(frame, length);
@@ -622,6 +653,14 @@ bool BaseState::tx_move_cmd(int16_t left_mm_s, int16_t right_mm_s) {
     return transmit_frame(&command, sizeof(command));
 }
 
+bool BaseState::tx_setpa_cmd(uint8_t pa_level) {
+    rf_protocol::SetPaCommand command{
+        {rf_protocol::CMD_SETPA, next_command_sequence()},
+        pa_level,
+    };
+    return transmit_frame(&command, sizeof(command));
+}
+
 void poll_wanderer(BaseState *state) {
     if (!state->poll_due()) {
         return;
@@ -634,198 +673,196 @@ void poll_wanderer(BaseState *state) {
 }
 
 void print_base_help() {
-    PRINTF("Commands:\r\n");
-    PRINTF("  help          Show commands\r\n");
-    PRINTF("  arm           Allow the Wanderer to move\r\n");
-    PRINTF("  stop          Stop and disarm Wanderer\r\n");
-    PRINTF("  move L R      Set signed left/right velocity in mm/s\r\n");
-    PRINTF("  getver        Request firmware version (async reply)\r\n");
-    PRINTF("  getstat       Request Wanderer status (async reply)\r\n");
+    // Help text is `*` log: human-facing, ignored by a machine parser.
+    PRINTF("*commands: arm | stop | move <vL> <vR> | ver | stat | "
+           "tlm on|off|<hz> | rf on|off | setbpa <0-3> | setwpa <0-3> | "
+           "ping | help\r\n");
 }
 
-void process_base_command_frame(const uint8_t *payload, uint8_t length,
-                                BaseState *state) {
-    // The binary host frame protocol carries the same command structs used
-    // over RF, just over USB CDC. Like the text CLI, every command is
-    // fire-and-forget: the host sends and watches the forwarded downlink
-    // stream for telemetry, replies, and events.
-    if (length < sizeof(rf_protocol::CommandHeader)) {
-        return;
-    }
-
-    rf_protocol::CommandHeader header{};
-    std::memcpy(&header, payload, sizeof(header));
-
-    if (header.type == rf_protocol::CMD_MOVE) {
-        if (length != sizeof(rf_protocol::MoveCommand)) {
-            return;
+// Case-insensitive compare of a parsed token against a lowercase literal.
+bool token_is(const char *token, const char *lower) {
+    while (*token != '\0' && *lower != '\0') {
+        char c = *token;
+        if (c >= 'A' && c <= 'Z') {
+            c = static_cast<char>(c - 'A' + 'a');
         }
-        rf_protocol::MoveCommand command{};
-        std::memcpy(&command, payload, sizeof(command));
-        state->tx_move_cmd(command.velocity_left_mm_s,
-                           command.velocity_right_mm_s);
-        return;
+        if (c != *lower) {
+            return false;
+        }
+        ++token;
+        ++lower;
     }
-
-    if (length != sizeof(header)) {
-        return;
-    }
-    switch (header.type) {
-        case rf_protocol::CMD_ARM:
-            state->tx_arm_cmd();
-            return;
-        case rf_protocol::CMD_STOP:
-            state->tx_stop_cmd();
-            return;
-        case rf_protocol::CMD_GETVER:
-            state->tx_getver_cmd();
-            return;
-        case rf_protocol::CMD_GETSTAT:
-            state->tx_getstat_cmd();
-            return;
-        default:
-            return;
-    }
+    return *token == '\0' && *lower == '\0';
 }
 
+// Parses a token as a velocity and reports whether it is a clean signed 16-bit
+// integer. The whole token must be consumed -- "12x" is rejected, not truncated.
+bool parse_velocity(const char *token, int16_t *out) {
+    char *end = nullptr;
+    const long value = std::strtol(token, &end, 10);
+    if (end == token || *end != '\0' || value < -32768L || value > 32767L) {
+        return false;
+    }
+    *out = static_cast<int16_t>(value);
+    return true;
+}
+
+// Parses a token as an nRF24 PA level (0 = MIN .. 3 = MAX). The whole token
+// must be consumed and the value must be in range.
+bool parse_pa(const char *token, uint8_t *out) {
+    char *end = nullptr;
+    const long value = std::strtol(token, &end, 10);
+    if (end == token || *end != '\0' || value < 0 || value > 3) {
+        return false;
+    }
+    *out = static_cast<uint8_t>(value);
+    return true;
+}
+
+// Handles one received command line (the verb and its arguments). Per
+// PROTOCOL.md the `=` ack is syntactic and emitted here, locally, before any
+// frame goes over the air; query answers and execution outcomes show up later
+// on the `>`/`#`/`!` channels.
 void process_base_command_line(char *line, BaseState *state) {
-    // This text CLI remains for manual debugging over a serial terminal. The
-    // binary host frame protocol (process_base_command_frame) carries the
-    // same command set for host software on the same USB CDC link.
-    if (std::strcmp(line, "help") == 0) {
+    // Split into whitespace-separated tokens in place. A fifth token, if any,
+    // stays attached to the fourth -- enough to reject over-long arg lists.
+    char *token[4];
+    int count = 0;
+    for (char *cursor = line; *cursor != '\0' && count < 4;) {
+        while (*cursor == ' ' || *cursor == '\t') {
+            ++cursor;
+        }
+        if (*cursor == '\0') {
+            break;
+        }
+        token[count++] = cursor;
+        while (*cursor != '\0' && *cursor != ' ' && *cursor != '\t') {
+            ++cursor;
+        }
+        if (*cursor != '\0') {
+            *cursor++ = '\0';
+        }
+    }
+
+    // Blank lines and `*` comments are ignored on input, so a command script
+    // may carry spacing and `*` annotations.
+    if (count == 0 || token[0][0] == '*') {
+        return;
+    }
+    const char *verb = token[0];
+
+    if (token_is(verb, "arm")) {
+        PRINTF("=ok arm\r\n");
+        state->tx_arm_cmd();
+    } else if (token_is(verb, "stop")) {
+        PRINTF("=ok stop\r\n");
+        state->tx_stop_cmd();
+    } else if (token_is(verb, "ver")) {
+        PRINTF("=ok ver\r\n");
+        state->tx_getver_cmd();
+    } else if (token_is(verb, "stat")) {
+        PRINTF("=ok stat\r\n");
+        state->tx_getstat_cmd();
+    } else if (token_is(verb, "move")) {
+        int16_t left = 0;
+        int16_t right = 0;
+        if (count != 3 || !parse_velocity(token[1], &left) ||
+            !parse_velocity(token[2], &right)) {
+            PRINTF("=err move: expected 2 integers\r\n");
+            return;
+        }
+        PRINTF("=ok move vL=%d vR=%d\r\n", left, right);
+        state->tx_move_cmd(left, right);
+    } else if (token_is(verb, "tlm")) {
+        if (count != 2) {
+            PRINTF("=err tlm: expected on|off|<hz>\r\n");
+        } else if (token_is(token[1], "on")) {
+            state->telemetry_every_frame();
+            PRINTF("=ok tlm on=1\r\n");
+        } else if (token_is(token[1], "off")) {
+            state->telemetry_off();
+            PRINTF("=ok tlm on=0\r\n");
+        } else {
+            char *end = nullptr;
+            const long hz = std::strtol(token[1], &end, 10);
+            if (end == token[1] || *end != '\0' || hz <= 0 || hz > 1000) {
+                PRINTF("=err tlm: expected on|off|<hz>\r\n");
+                return;
+            }
+            state->telemetry_rate(static_cast<uint32_t>(hz));
+            PRINTF("=ok tlm rate=%ld on=1\r\n", hz);
+        }
+    } else if (token_is(verb, "rf")) {
+        // Base-local nRF24 link stats; `rf on|off` toggles a 1 Hz auto-repeat.
+        if (count == 1) {
+            PRINTF("=ok rf\r\n");
+            state->report_rf_stats();
+        } else if (count == 2 && token_is(token[1], "on")) {
+            state->rf_auto_enable();
+            PRINTF("=ok rf on=1\r\n");
+        } else if (count == 2 && token_is(token[1], "off")) {
+            state->rf_auto_disable();
+            PRINTF("=ok rf on=0\r\n");
+        } else {
+            PRINTF("=err rf: expected on|off\r\n");
+        }
+    } else if (token_is(verb, "setbpa")) {
+        // Base-local: set this radio's PA and echo the level read back.
+        uint8_t pa = 0;
+        if (count != 2 || !parse_pa(token[1], &pa)) {
+            PRINTF("=err setbpa: expected 0-3\r\n");
+        } else {
+            radio.setPALevel(pa);
+            PRINTF("=ok setbpa pa=%u\r\n", radio.getPALevel());
+        }
+    } else if (token_is(verb, "setwpa")) {
+        // Forwarded: the Wanderer applies it and answers `>pa=` with the level
+        // actually in effect a poll later.
+        uint8_t pa = 0;
+        if (count != 2 || !parse_pa(token[1], &pa)) {
+            PRINTF("=err setwpa: expected 0-3\r\n");
+        } else {
+            PRINTF("=ok setwpa pa=%u\r\n", pa);
+            state->tx_setpa_cmd(pa);
+        }
+    } else if (token_is(verb, "ping")) {
+        // Base-local liveness: answers even when the RF link is down.
+        PRINTF("=ok ping\r\n");
+    } else if (token_is(verb, "help")) {
         print_base_help();
-    } else if (std::strcmp(line, "arm") == 0) {
-        PRINTF(state->tx_arm_cmd()
-                   ? "ARM delivered\r\n"
-                   : "ARM failed: no acknowledgement\r\n");
-    } else if (std::strcmp(line, "stop") == 0) {
-        PRINTF(state->tx_stop_cmd()
-                   ? "STOP delivered\r\n"
-                   : "STOP failed: no acknowledgement\r\n");
-    } else if (std::strcmp(line, "getver") == 0) {
-        PRINTF(state->tx_getver_cmd()
-                   ? "GETVER sent; version will follow\r\n"
-                   : "GETVER failed: no acknowledgement\r\n");
-    } else if (std::strcmp(line, "getstat") == 0) {
-        PRINTF(state->tx_getstat_cmd()
-                   ? "GETSTAT sent; status will follow\r\n"
-                   : "GETSTAT failed: no acknowledgement\r\n");
-    } else if (std::strncmp(line, "move ", 5) == 0) {
-        char *end = nullptr;
-        const long left = std::strtol(line + 5, &end, 10);
-        if (end == line + 5) {
-            PRINTF("Usage: move L R\r\n");
-            return;
-        }
-
-        while (*end == ' ') {
-            ++end;
-        }
-        char *right_start = end;
-        const long right = std::strtol(right_start, &end, 10);
-        while (*end == ' ') {
-            ++end;
-        }
-        if (end == right_start || *end != '\0' ||
-            left < -32768L || left > 32767L ||
-            right < -32768L || right > 32767L) {
-            PRINTF("Usage: move L R; values must fit signed 16-bit\r\n");
-            return;
-        }
-
-        PRINTF(state->tx_move_cmd(static_cast<int16_t>(left),
-                                  static_cast<int16_t>(right))
-                   ? "MOVE delivered\r\n"
-                   : "MOVE failed: no acknowledgement\r\n");
-    } else if (line[0] != '\0') {
-        PRINTF("Unknown command. Type 'help'.\r\n");
+        PRINTF("=ok help\r\n");
+    } else {
+        PRINTF("=err unknown command: %s\r\n", verb);
     }
 }
-
-enum class HostInputState : uint8_t {
-    Text,
-    FrameLength,
-    FramePayload,
-    FrameCrc,
-};
 
 void poll_base_usb(BaseState *state) {
-    // USB CDC is a byte stream shared by the typed text CLI and binary host
-    // frames. A frame always starts with FRAME_SYNC, a byte outside printable
-    // ASCII that a human never types, so the two coexist on one stream.
+    // USB CDC carries one encoding now: text, one command per line. A line is
+    // collected until newline, then parsed; nothing else shares the stream.
     static char line[COMMAND_LINE_SIZE];
-    static size_t line_length;
-    static HostInputState input_state = HostInputState::Text;
-    static uint8_t frame_payload[rf_protocol::MAX_PAYLOAD_SIZE];
-    static uint8_t frame_length;
-    static uint8_t frame_received;
-    static uint8_t frame_crc[2];
+    static size_t line_length = 0;
+    static bool overflow = false;
 
     int input = 0;
     while ((input = getchar_timeout_us(0)) != PICO_ERROR_TIMEOUT) {
-        const uint8_t byte = static_cast<uint8_t>(input);
-
-        if (input_state == HostInputState::Text) {
-            if (byte == rf_protocol::FRAME_SYNC) {
-                input_state = HostInputState::FrameLength;
-            } else if (input == '\r' || input == '\n') {
-                if (line_length != 0) {
-                    line[line_length] = '\0';
-                    process_base_command_line(line, state);
-                    line_length = 0;
-                }
-            } else if (input == '\b' || input == 0x7F) {
-                if (line_length != 0) {
-                    --line_length;
-                }
-            } else if (line_length + 1 < sizeof(line)) {
-                line[line_length++] = static_cast<char>(input);
+        // A leading '\r' is tolerated so '\r\n' terminators work: the '\r'
+        // ends the (here empty) line and the following '\n' is a no-op.
+        if (input == '\n' || input == '\r') {
+            if (overflow) {
+                PRINTF("=err line too long\r\n");
+            } else if (line_length != 0) {
+                line[line_length] = '\0';
+                process_base_command_line(line, state);
             }
-            continue;
+            line_length = 0;
+            overflow = false;
+        } else if (overflow) {
+            continue;  // discard an over-length line to the next newline
+        } else if (line_length + 1 < sizeof(line)) {
+            line[line_length++] = static_cast<char>(input);
+        } else {
+            overflow = true;
         }
-
-        if (input_state == HostInputState::FrameLength) {
-            if (byte > rf_protocol::MAX_PAYLOAD_SIZE) {
-                // Implausible length; resync on the next FRAME_SYNC byte.
-                input_state = HostInputState::Text;
-                continue;
-            }
-            frame_length = byte;
-            frame_received = 0;
-            input_state = frame_length == 0 ? HostInputState::FrameCrc
-                                            : HostInputState::FramePayload;
-            continue;
-        }
-
-        if (input_state == HostInputState::FramePayload) {
-            frame_payload[frame_received++] = byte;
-            if (frame_received == frame_length) {
-                input_state = HostInputState::FrameCrc;
-                frame_received = 0;
-            }
-            continue;
-        }
-
-        // HostInputState::FrameCrc
-        frame_crc[frame_received++] = byte;
-        if (frame_received < 2) {
-            continue;
-        }
-
-        input_state = HostInputState::Text;
-        uint8_t check_buffer[1 + rf_protocol::MAX_PAYLOAD_SIZE];
-        check_buffer[0] = frame_length;
-        std::memcpy(check_buffer + 1, frame_payload, frame_length);
-        const uint16_t expected =
-            static_cast<uint16_t>(frame_crc[0]) |
-            (static_cast<uint16_t>(frame_crc[1]) << 8);
-        if (expected ==
-            crc16_ccitt(check_buffer,
-                        static_cast<std::size_t>(frame_length) + 1)) {
-            process_base_command_frame(frame_payload, frame_length, state);
-        }
-        // A CRC mismatch silently drops the frame; the next FRAME_SYNC byte
-        // resynchronizes the receiver.
     }
 }
 
@@ -845,11 +882,15 @@ int main() {
         sleep_ms(100);
     }
 
-    PRINTF("\r\nPico2 V2 RF ACK-payload transport\r\n");
-    PRINTF("Role: %s\r\n", role == Role::Base ? "base" : "wanderer");
-    PRINTF("RF24: %s\r\n", radio_ready ? "detected" : "not detected");
     if (role == Role::Base) {
+        // The base speaks only the laptop text protocol, so its banner is a
+        // `*` log line a machine client skips and a human can read.
+        PRINTF("*Pico2 V2 RF base ready (RF24 %s)\r\n",
+               radio_ready ? "detected" : "not detected");
         print_base_help();
+    } else {
+        PRINTF("\r\nPico2 V2 RF wanderer (RF24 %s)\r\n",
+               radio_ready ? "detected" : "not detected");
     }
 
     gpio_init(PICO_DEFAULT_LED_PIN);
@@ -876,6 +917,9 @@ int main() {
             if (role == Role::Base) {
                 poll_base_usb(&base);
                 poll_wanderer(&base);
+                if (base.rf_report_due()) {
+                    base.report_rf_stats();
+                }
             } else {
                 TacticalState before = wanderer.state();
                 process_wanderer_radio(&wanderer);
@@ -893,7 +937,7 @@ int main() {
             bool connected = radio.isChipConnected();
             if (connected != radio_connected) {
                 radio_connected = connected;
-                PRINTF("RF24: %s\r\n",
+                PRINTF("*RF24: %s\r\n",
                        connected ? "detected" : "not detected");
             }
             next_radio_health = make_timeout_time_ms(RADIO_HEALTH_PERIOD_MS);

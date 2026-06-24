@@ -91,6 +91,9 @@ crosses the RF link.
 | `ver`  | —                     | `CMD_GETVER`  | forwarded to Wanderer          |
 | `stat` | —                     | `CMD_GETSTAT` | forwarded to Wanderer          |
 | `tlm`  | `on` \| `off` \| `<hz>` | —           | Base-local (forwarding control)|
+| `rf`   | — \| `on` \| `off`    | `CMD_GETPA`   | Base-local stats; also queries Wanderer PA |
+| `setbpa`| `<0-3>`              | —             | Base-local (set *Base* PA level) |
+| `setwpa`| `<0-3>`              | `CMD_SETPA`   | Set *Wanderer* PA; `>pa=` confirms |
 | `ping` | —                     | —             | Base-local (is the *Base* up)  |
 | `help` | —                     | —             | Base-local                     |
 
@@ -152,6 +155,32 @@ preferred on this channel because readability is the point.
 |--------|-------------------------------------|-------------------|
 | `>ver` | `fw=<major>.<minor>`                | Wanderer firmware |
 | `>stat`| `armed=<0/1> moving=<0/1> vL=<int> vR=<int>` | Wanderer  |
+| `>rf`  | `link=<up/down> sent=<n> ok=<n> lost=<n> arc=<0-15> rpd=<0/1> chan=<n> pa_base=<0-3>` | Base (local) |
+| `>pa`  | `=<0-3>` (i.e. `>pa=2`)             | Wanderer firmware |
+
+`>rf` is the nRF24 link readout, for range tests. The base polls the Wanderer
+at ~100 Hz, so `sent`/`ok`/`lost` are the delivery counts (hardware ACKs) over
+the interval **since the previous `>rf` report** — instantaneous link quality,
+not a lifetime total. `arc` is the last packet's auto-retransmit count (0–15, a
+rough signal-margin proxy) and `rpd` is the received-power detector (`1` = last
+received signal ≥ −64 dBm). `pa_base` is the base's own PA level (0 = MIN ..
+3 = MAX). `rf on` repeats the report once a second so the link can be watched
+dynamically while walking out the range; `rf off` stops it.
+
+`>rf` reports only the **base** PA, which the base reads directly. The
+**Wanderer's** PA is on the remote board, so each `rf` report also issues a
+`CMD_GETPA` query; the Wanderer's answer arrives a poll later as a separate
+`>pa=<0-3>` line. A query, not telemetry: PA rarely changes, so it is fetched on
+demand rather than carried in every heartbeat.
+
+PA is settable from either end. `setbpa <0-3>` sets the **base** radio's PA
+locally; the `=ok setbpa pa=<n>` ack echoes the level read back from the radio.
+`setwpa <0-3>` forwards `CMD_SETPA` to the **Wanderer**, which applies it and
+replies `>pa=<n>` with the level actually in effect — so "try to set" is
+confirmed by read-back. An out-of-range Wanderer value leaves its PA untouched
+and the `>pa=` reply shows it unchanged. (`setwpa` only changes the Wanderer's
+transmit power, which the base sees as ACK-payload signal strength; to also
+match the base's own power, set `setbpa` to taste.)
 
 ### `!` events
 
@@ -279,11 +308,14 @@ pre-reserved:
 
 ```
 Laptop -> Base (bare verbs):
-  arm | stop | move <vL> <vR> | ver | stat | tlm on|off|<hz> | ping | help
+  arm | stop | move <vL> <vR> | ver | stat | tlm on|off|<hz> | rf on|off
+  setbpa <0-3> | setwpa <0-3> | ping | help
 
 Base -> Laptop (sigil + payload):
   =  result      =ok <verb> ...        =err <reason>
   >  data reply  >ver fw=...            >stat armed=.. moving=.. vL=.. vR=..
+                 >rf link=.. sent=.. ok=.. lost=.. arc=.. rpd=.. chan=.. pa_base=..
+                 >pa=..  (Wanderer PA, follows an `rf` query a poll later)
   #  telemetry   #seq=.. state=.. armed=.. moving=..
   !  event       !state from=.. to=..  !link up|down
   *  log         *free text (ignored by machines)
