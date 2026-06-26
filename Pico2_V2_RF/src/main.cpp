@@ -29,7 +29,7 @@ constexpr size_t COMMAND_LINE_SIZE = 64;
 constexpr uint8_t RADIO_ADDRESS[5] = {'V', '2', 'R', 'F', '1'};
 
 constexpr uint8_t FIRMWARE_MAJOR = 0;
-constexpr uint8_t FIRMWARE_MINOR = 3;
+constexpr uint8_t FIRMWARE_MINOR = 4;
 
 enum class Role : uint8_t {
     Wanderer,
@@ -677,6 +677,9 @@ void print_base_help() {
     PRINTF("*commands: arm | stop | move <vL> <vR> | ver | stat | "
            "tlm on|off|<hz> | rf on|off | setbpa <0-3> | setwpa <0-3> | "
            "ping | help\r\n");
+    PRINTF("*rf fields: arc=auto-retransmit count of last packet (0-15, "
+           "lower is better link margin); rpd=received power detector "
+           "(1 = last signal stronger than ~-64 dBm)\r\n");
 }
 
 // Case-insensitive compare of a parsed token against a lowercase literal.
