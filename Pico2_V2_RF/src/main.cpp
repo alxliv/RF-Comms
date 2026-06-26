@@ -913,23 +913,26 @@ int main() {
     bool radio_connected = radio_ready;
 
     while (true) {
-        if (radio_ready) {
-            if (role == Role::Base) {
-                poll_base_usb(&base);
+        if (role == Role::Base) {
+            // The USB console is the base's lifeline to the laptop and must run
+            // every loop regardless of radio state -- a missing or unpowered
+            // nRF24 must never silence command handling. Only the actions that
+            // actually touch the radio are gated on radio_ready.
+            poll_base_usb(&base);
+            if (radio_ready) {
                 poll_wanderer(&base);
                 if (base.rf_report_due()) {
                     base.report_rf_stats();
                 }
-            } else {
-                TacticalState before = wanderer.state();
-                process_wanderer_radio(&wanderer);
-                wanderer.tick(get_absolute_time());
-                if (wanderer.state() != before) {
-                    PRINTF("TacticalState changed. From %u to %u\r\n",
-                           static_cast<unsigned>(before),
-                           static_cast<unsigned>(wanderer.state()));
-                }
-
+            }
+        } else if (radio_ready) {
+            TacticalState before = wanderer.state();
+            process_wanderer_radio(&wanderer);
+            wanderer.tick(get_absolute_time());
+            if (wanderer.state() != before) {
+                PRINTF("TacticalState changed. From %u to %u\r\n",
+                       static_cast<unsigned>(before),
+                       static_cast<unsigned>(wanderer.state()));
             }
         }
 
@@ -937,8 +940,18 @@ int main() {
             bool connected = radio.isChipConnected();
             if (connected != radio_connected) {
                 radio_connected = connected;
+                // Re-detect across power cycles: when the nRF24 comes back, the
+                // chip is at power-on defaults, so rerun begin()+configure()
+                // before declaring it ready again. This lets the RF link resume
+                // after the radio is repowered without rebooting the base.
+                radio_ready =
+                    connected && radio.begin(&radio_spi) && configure_radio(role);
+                if (radio_ready && role == Role::Wanderer) {
+                    stage_next_ack_payload(&wanderer);
+                    radio.startListening();
+                }
                 PRINTF("*RF24: %s\r\n",
-                       connected ? "detected" : "not detected");
+                       radio_ready ? "detected" : "not detected");
             }
             next_radio_health = make_timeout_time_ms(RADIO_HEALTH_PERIOD_MS);
         }
