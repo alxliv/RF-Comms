@@ -17,10 +17,12 @@ constexpr uint8_t PIN_RF_MISO = 16;
 constexpr uint8_t PIN_RF_SCK = 18;
 constexpr uint8_t PIN_RF_MOSI = 19;
 constexpr uint8_t PIN_ROLE = 20;
+constexpr uint8_t PIN_LINK_LED = 2;  // Wanderer-only: RF link-good indicator
 
 // Both boards run the same firmware. GP20 selects what this board does:
 // high = laptop-side base, low = vehicle-side Wanderer.
 constexpr uint8_t RADIO_CHANNEL = 76;
+constexpr uint32_t LINK_LED_PERIOD_MS = 250;  // ~2 blinks/sec while link is up
 constexpr uint8_t RADIO_PIPE = 1;
 constexpr uint32_t POLL_PERIOD_MS = 10;
 constexpr uint32_t RADIO_HEALTH_PERIOD_MS = 1000;
@@ -29,7 +31,7 @@ constexpr size_t COMMAND_LINE_SIZE = 64;
 constexpr uint8_t RADIO_ADDRESS[5] = {'V', '2', 'R', 'F', '1'};
 
 constexpr uint8_t FIRMWARE_MAJOR = 0;
-constexpr uint8_t FIRMWARE_MINOR = 4;
+constexpr uint8_t FIRMWARE_MINOR = 5;
 
 enum class Role : uint8_t {
     Wanderer,
@@ -900,6 +902,14 @@ int main() {
     gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
     gpio_put(PICO_DEFAULT_LED_PIN, false);
 
+    if (role == Role::Wanderer) {
+        // External link-good indicator on GP2: blinks while the base is heard,
+        // off when the link drops. Wanderer-only -- the base leaves GP2 alone.
+        gpio_init(PIN_LINK_LED);
+        gpio_set_dir(PIN_LINK_LED, GPIO_OUT);
+        gpio_put(PIN_LINK_LED, false);
+    }
+
     TacticalCore wanderer;
     BaseState base;
 
@@ -911,6 +921,7 @@ int main() {
     }
 
     absolute_time_t next_led_toggle = make_timeout_time_ms(500);
+    absolute_time_t next_link_led_toggle = make_timeout_time_ms(LINK_LED_PERIOD_MS);
     absolute_time_t next_radio_health =
         make_timeout_time_ms(RADIO_HEALTH_PERIOD_MS);
     bool radio_connected = radio_ready;
@@ -962,6 +973,21 @@ int main() {
         if (time_reached(next_led_toggle)) {
             gpio_xor_mask(1u << PICO_DEFAULT_LED_PIN);
             next_led_toggle = make_timeout_time_ms(500);
+        }
+
+        // GP2 link-good LED: blink while the base is heard, hold off otherwise.
+        // Runs every loop (not just when radio_ready) so a dropped radio forces
+        // the LED dark instead of freezing it mid-blink.
+        if (role == Role::Wanderer) {
+            bool link_up =
+                radio_ready && wanderer.commander_alive(get_absolute_time());
+            if (!link_up) {
+                gpio_put(PIN_LINK_LED, false);
+                next_link_led_toggle = make_timeout_time_ms(LINK_LED_PERIOD_MS);
+            } else if (time_reached(next_link_led_toggle)) {
+                gpio_xor_mask(1u << PIN_LINK_LED);
+                next_link_led_toggle = make_timeout_time_ms(LINK_LED_PERIOD_MS);
+            }
         }
         tight_loop_contents();
     }

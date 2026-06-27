@@ -21,6 +21,15 @@ public:
     // is talking to me" is separate from "what it asked for".
     void note_commander_alive(absolute_time_t now) { last_seen_ = now; }
 
+    // True while a commander frame has been heard within the liveness window --
+    // the same "link is good" test tick() uses before falling back. Read by the
+    // radio layer to drive the Wanderer's link-status LED. False until the first
+    // frame, since last_seen_ starts at the epoch.
+    bool commander_alive(absolute_time_t now) const {
+        return absolute_time_diff_us(last_seen_, now) <
+               static_cast<int64_t>(LIVENESS_TIMEOUT_MS) * 1000;
+    }
+
     void cmd_arm(absolute_time_t now) {
         if (state_ == TacticalState::Safe) enter(TacticalState::Active, now);
     }
