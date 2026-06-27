@@ -408,16 +408,22 @@ The current V2 firmware:
   SPI.
 - Sends startup diagnostics through USB CDC.
 
-Current radio connections:
+Current radio connections (on `spi1`, chosen to clear the Wanderer's
+occupied GPIOs — motors, encoders, I²C, ToF, UART):
 
 ```text
-GP14 = CE
-GP17 = CSN
-GP16 = MISO
-GP18 = SCK
-GP19 = MOSI
-GP20 = role strap: high = base, low = Wanderer
+GP14 = SCK   (spi1 SCK)
+GP15 = MOSI  (spi1 TX)
+GP28 = MISO  (spi1 RX)
+GP9  = CSN
+GP21 = CE
+GP22 = role strap: high = base, low = Wanderer
+GP2  = Wanderer-only RF link-good LED (active high, use a series resistor)
 ```
+
+These pins avoid every GPIO the Wanderer already uses
+(`Wanderer/hardware/wiring.md`). `spi0` could not be reused because its
+MISO/RX function only maps to GP0/4/16/20, all of which the Wanderer occupies.
 
 ### Building Pico2 V2 RF
 
@@ -642,9 +648,33 @@ getver
 getstat
 ```
 
-The CLI is available only on the base-role Pico. USB output follows the
+This full CLI is the base-role Pico's laptop link. USB output follows the
 current CDC connection state, so closing and reopening the terminal does not
 permanently suppress command responses.
+
+The Wanderer-role Pico has its own **local debug console** on USB CDC, active
+whenever a terminal is attached (independent of the RF link). It acts directly
+on this board rather than sending anything over the air, for bench-testing a
+Wanderer without a base:
+
+```text
+help
+arm
+stop
+move L R
+ver
+stat
+setpa 0-3
+rf
+```
+
+`arm`/`stop`/`move` drive the local `TacticalCore` FSM as if a commander issued
+them (a local command counts as a live commander, so the FSM does not fall back
+for want of a remote one; stop typing and it ramps to a stop after the liveness
+timeout, exactly as on link loss). `stat` reports local FSM state and targets,
+`ver` the firmware version, `setpa` sets this board's own nRF24 PA, and `rf`
+shows the local radio view (PA, channel, last RPD, and whether a commander is
+currently heard).
 
 `arm` sends `CMD_ARM` once and reports the nRF24 hardware acknowledgement,
 the same as `stop` and `move`:

@@ -11,15 +11,20 @@ using rf_protocol::TacticalState;
 
 namespace {
 
-constexpr uint8_t PIN_RF_CE = 14;
-constexpr uint8_t PIN_RF_CSN = 17;
-constexpr uint8_t PIN_RF_MISO = 16;
-constexpr uint8_t PIN_RF_SCK = 18;
-constexpr uint8_t PIN_RF_MOSI = 19;
-constexpr uint8_t PIN_ROLE = 20;
+// Pins are chosen to clear the Wanderer's occupied GPIOs (motors GP16/17/19/20,
+// encoders GP10-13, I2C GP4-7, ToF GP8, UART GP0/1). SPI0's MISO/RX function
+// only reaches GP0/4/16/20 -- all taken on the Wanderer -- so the radio runs on
+// spi1 (see SPI_INSTANCE below). SCK/MOSI/MISO must be valid spi1 pins; CE, CSN,
+// and ROLE are plain GPIO and can be any free pin.
+constexpr uint8_t PIN_RF_CE = 21;
+constexpr uint8_t PIN_RF_CSN = 9;     // spi1 CSn (driven in software by RF24)
+constexpr uint8_t PIN_RF_MISO = 28;   // spi1 RX (only free spi1 RX pin)
+constexpr uint8_t PIN_RF_SCK = 14;    // spi1 SCK
+constexpr uint8_t PIN_RF_MOSI = 15;   // spi1 TX
+constexpr uint8_t PIN_ROLE = 22;
 constexpr uint8_t PIN_LINK_LED = 2;  // Wanderer-only: RF link-good indicator
 
-// Both boards run the same firmware. GP20 selects what this board does:
+// Both boards run the same firmware. PIN_ROLE selects what this board does:
 // high = laptop-side base, low = vehicle-side Wanderer.
 constexpr uint8_t RADIO_CHANNEL = 76;
 constexpr uint32_t LINK_LED_PERIOD_MS = 250;  // ~2 blinks/sec while link is up
@@ -31,7 +36,7 @@ constexpr size_t COMMAND_LINE_SIZE = 64;
 constexpr uint8_t RADIO_ADDRESS[5] = {'V', '2', 'R', 'F', '1'};
 
 constexpr uint8_t FIRMWARE_MAJOR = 0;
-constexpr uint8_t FIRMWARE_MINOR = 5;
+constexpr uint8_t FIRMWARE_MINOR = 7;
 
 enum class Role : uint8_t {
     Wanderer,
@@ -684,6 +689,16 @@ void print_base_help() {
            "(1 = last signal stronger than ~-64 dBm)\r\n");
 }
 
+void print_wanderer_help() {
+    // The Wanderer's local debug console: a subset that acts directly on this
+    // board, with no base or RF link involved. Read commands report local state;
+    // arm/stop/move drive the FSM as if a commander issued them; setpa changes
+    // this radio's own PA level.
+    PRINTF("*wanderer debug console (local, USB only)\r\n");
+    PRINTF("*commands: arm | stop | move <vL> <vR> | ver | stat | rf | "
+           "setpa <0-3> | help\r\n");
+}
+
 // Case-insensitive compare of a parsed token against a lowercase literal.
 bool token_is(const char *token, const char *lower) {
     while (*token != '\0' && *lower != '\0') {
@@ -724,16 +739,12 @@ bool parse_pa(const char *token, uint8_t *out) {
     return true;
 }
 
-// Handles one received command line (the verb and its arguments). Per
-// PROTOCOL.md the `=` ack is syntactic and emitted here, locally, before any
-// frame goes over the air; query answers and execution outcomes show up later
-// on the `>`/`#`/`!` channels.
-void process_base_command_line(char *line, BaseState *state) {
-    // Split into whitespace-separated tokens in place. A fifth token, if any,
-    // stays attached to the fourth -- enough to reject over-long arg lists.
-    char *token[4];
+// Splits `line` in place into at most `max` whitespace-separated tokens and
+// returns the count. Anything past the limit stays attached to the last token,
+// which is enough to reject over-long arg lists. Shared by both command parsers.
+int tokenize(char *line, char **token, int max) {
     int count = 0;
-    for (char *cursor = line; *cursor != '\0' && count < 4;) {
+    for (char *cursor = line; *cursor != '\0' && count < max;) {
         while (*cursor == ' ' || *cursor == '\t') {
             ++cursor;
         }
@@ -748,6 +759,16 @@ void process_base_command_line(char *line, BaseState *state) {
             *cursor++ = '\0';
         }
     }
+    return count;
+}
+
+// Handles one received command line (the verb and its arguments). Per
+// PROTOCOL.md the `=` ack is syntactic and emitted here, locally, before any
+// frame goes over the air; query answers and execution outcomes show up later
+// on the `>`/`#`/`!` channels.
+void process_base_command_line(char *line, BaseState *state) {
+    char *token[4];
+    int count = tokenize(line, token, 4);
 
     // Blank lines and `*` comments are ignored on input, so a command script
     // may carry spacing and `*` annotations.
@@ -841,9 +862,83 @@ void process_base_command_line(char *line, BaseState *state) {
     }
 }
 
-void poll_base_usb(BaseState *state) {
-    // USB CDC carries one encoding now: text, one command per line. A line is
-    // collected until newline, then parsed; nothing else shares the stream.
+// The Wanderer's local debug console, the counterpart to
+// process_base_command_line. Everything here acts directly on this board: read
+// commands report local state, arm/stop/move drive the FSM as if a commander
+// issued them, and setpa changes this radio's PA. No frame goes over the air.
+void process_wanderer_command_line(char *line, TacticalCore *core) {
+    char *token[4];
+    int count = tokenize(line, token, 4);
+    if (count == 0 || token[0][0] == '*') {
+        return;
+    }
+    const char *verb = token[0];
+    const absolute_time_t now = get_absolute_time();
+
+    if (token_is(verb, "arm")) {
+        // A local command makes this console the live commander, so the FSM does
+        // not immediately fall back for want of a remote one.
+        core->note_commander_alive(now);
+        core->cmd_arm(now);
+        PRINTF("=ok arm\r\n");
+    } else if (token_is(verb, "stop")) {
+        core->cmd_stop(now);
+        PRINTF("=ok stop\r\n");
+    } else if (token_is(verb, "move")) {
+        int16_t left = 0;
+        int16_t right = 0;
+        if (count != 3 || !parse_velocity(token[1], &left) ||
+            !parse_velocity(token[2], &right)) {
+            PRINTF("=err move: expected 2 integers\r\n");
+            return;
+        }
+        core->note_commander_alive(now);
+        if (core->cmd_move(left, right, now)) {
+            PRINTF("=ok move vL=%d vR=%d\r\n", left, right);
+        } else {
+            PRINTF("=err move: not active (arm first)\r\n");
+        }
+    } else if (token_is(verb, "ver")) {
+        PRINTF(">ver fw=%u.%u\r\n", FIRMWARE_MAJOR, FIRMWARE_MINOR);
+        PRINTF("=ok ver\r\n");
+    } else if (token_is(verb, "stat")) {
+        const uint8_t flags = wanderer_flags(core);
+        PRINTF(">stat state=%s armed=%d moving=%d vL=%d vR=%d\r\n",
+               tactical_state_name(static_cast<uint8_t>(core->state())),
+               (flags & rf_protocol::WAND_ARMED) ? 1 : 0,
+               (flags & rf_protocol::WAND_MOVING) ? 1 : 0,
+               core->target_left(), core->target_right());
+        PRINTF("=ok stat\r\n");
+    } else if (token_is(verb, "rf")) {
+        // Local radio view. The Wanderer is a receiver, so it has no TX/ACK
+        // counters like the base -- it reports its PA, channel, the last RPD,
+        // and whether a commander has been heard within the liveness window.
+        PRINTF(">rf link=%s pa=%u chan=%u rpd=%d\r\n",
+               core->commander_alive(now) ? "up" : "down", radio.getPALevel(),
+               radio.getChannel(), radio.testRPD() ? 1 : 0);
+        PRINTF("=ok rf\r\n");
+    } else if (token_is(verb, "setpa")) {
+        uint8_t pa = 0;
+        if (count != 2 || !parse_pa(token[1], &pa)) {
+            PRINTF("=err setpa: expected 0-3\r\n");
+        } else {
+            radio.setPALevel(pa);
+            PRINTF("=ok setpa pa=%u\r\n", radio.getPALevel());
+        }
+    } else if (token_is(verb, "help")) {
+        print_wanderer_help();
+        PRINTF("=ok help\r\n");
+    } else {
+        PRINTF("=err unknown command: %s\r\n", verb);
+    }
+}
+
+// USB CDC carries one encoding: text, one command per line. A line is collected
+// until newline, then handed to `handle`; nothing else shares the stream. Both
+// roles share this reader -- the base for its laptop CLI, the Wanderer for its
+// local debug console -- so the per-line handler is a parameter. The line buffer
+// is static, which is safe because only one role's poller runs on a given board.
+void poll_usb_lines(void (*handle)(char *line, void *context), void *context) {
     static char line[COMMAND_LINE_SIZE];
     static size_t line_length = 0;
     static bool overflow = false;
@@ -857,7 +952,7 @@ void poll_base_usb(BaseState *state) {
                 PRINTF("=err line too long\r\n");
             } else if (line_length != 0) {
                 line[line_length] = '\0';
-                process_base_command_line(line, state);
+                handle(line, context);
             }
             line_length = 0;
             overflow = false;
@@ -871,13 +966,21 @@ void poll_base_usb(BaseState *state) {
     }
 }
 
+void base_line_handler(char *line, void *context) {
+    process_base_command_line(line, static_cast<BaseState *>(context));
+}
+
+void wanderer_line_handler(char *line, void *context) {
+    process_wanderer_command_line(line, static_cast<TacticalCore *>(context));
+}
+
 }  // namespace
 
 int main() {
     stdio_init_all();
 
     const Role role = read_role();
-    radio_spi.begin(spi0, PIN_RF_SCK, PIN_RF_MOSI, PIN_RF_MISO);
+    radio_spi.begin(spi1, PIN_RF_SCK, PIN_RF_MOSI, PIN_RF_MISO);
     bool radio_ready =
         radio.begin(&radio_spi) && configure_radio(role);
 
@@ -894,7 +997,8 @@ int main() {
                radio_ready ? "detected" : "not detected");
         print_base_help();
     } else {
-        PRINTF("\r\nPico2 V2 RF wanderer (RF24 %s)\r\n",
+        PRINTF("\r\nPico2 V2 RF wanderer (RF24 %s) -- type 'help' for the "
+               "local debug console\r\n",
                radio_ready ? "detected" : "not detected");
     }
 
@@ -932,16 +1036,26 @@ int main() {
             // every loop regardless of radio state -- a missing or unpowered
             // nRF24 must never silence command handling. Only the actions that
             // actually touch the radio are gated on radio_ready.
-            poll_base_usb(&base);
+            poll_usb_lines(base_line_handler, &base);
             if (radio_ready) {
                 poll_wanderer(&base);
                 if (base.rf_report_due()) {
                     base.report_rf_stats();
                 }
             }
-        } else if (radio_ready) {
+        } else {
+            // Wanderer. The local USB debug console runs whenever a terminal is
+            // attached, independent of the radio, so the board can be inspected
+            // and driven even with the nRF24 absent. Only radio command handling
+            // is gated on radio_ready; the FSM ticks regardless so locally
+            // issued arm/move actually advance state and fall back on silence.
+            if (stdio_usb_connected()) {
+                poll_usb_lines(wanderer_line_handler, &wanderer);
+            }
             TacticalState before = wanderer.state();
-            process_wanderer_radio(&wanderer);
+            if (radio_ready) {
+                process_wanderer_radio(&wanderer);
+            }
             wanderer.tick(get_absolute_time());
             if (wanderer.state() != before) {
                 PRINTF("TacticalState changed. From %u to %u\r\n",
